@@ -298,6 +298,42 @@ def default_workers() -> int:
     return max(2, cpu - max(1, cpu // 4))
 
 
+def _shutdown_now(pool: ProcessPoolExecutor) -> None:
+    """Stop a pool promptly, making a best effort to not orphan workers.
+
+    Plain `shutdown(wait=False)` returns immediately and leaves workers (and
+    their native ffmpeg work) running -- the orphan bug. We instead SIGKILL the
+    live worker processes directly (their native hashing isn't cancellable any
+    other way) and join each with a timeout, then shut the executor down. In the
+    normal case every worker is reaped before we return; the join timeout is a
+    safety valve so a worker wedged in uninterruptible IO can't hang the whole
+    program -- in that rare case one process may briefly outlive this call, but
+    it is already SIGKILLed and the OS reaps it once the IO completes.
+    """
+    # Snapshot the worker processes BEFORE shutdown() (which may clear the pool's
+    # bookkeeping). `_processes` is a private {pid: Process} dict, possibly None
+    # before the pool finishes spinning up -- guard it. SIGKILL each live worker
+    # directly (ffmpeg mid-decode won't honour SIGTERM promptly); kill() then
+    # join() guarantees the OS has reaped them, so none are orphaned.
+    procs = list((getattr(pool, "_processes", None) or {}).values())
+    for p in procs:
+        try:
+            if p.is_alive():
+                p.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    for p in procs:
+        try:
+            p.join(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+    # Now tell the executor to tear down its queues/threads; workers are gone.
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def sync(root: str | Path, params: HashParams,
          workers: int | None = None) -> SyncStats:
     """Reconcile the per-folder cache with the videos currently under *root*.
@@ -395,10 +431,44 @@ def sync(root: str | Path, params: HashParams,
             old_home=old_home,
         )
 
-    # ---- Phase 2: hash new/stale videos in parallel, then write every record ----
-    to_hash = [(p.hash_path, fid) for fid, p in plans.items() if p.kind != "cached"]
-    features_by_fid: dict[str, list[FrameFeature]] = {}
     failed_fids: set[str] = set()
+
+    # ---- Write unchanged records first (free -- no hashing) ----
+    # Doing this before hashing means a Ctrl+C during hashing still leaves every
+    # cached record's path/stat refreshed on disk.
+    for fid, plan in plans.items():
+        if plan.kind != "cached":
+            continue
+        try:
+            rec = replace(plan.cached_rec,          # copy; don't mutate `existing`
+                          paths=list(plan.paths),
+                          stat_by_path=dict(plan.stats_by_path))
+            save_record(rec, plan.folder)
+            location[fid] = plan.folder
+            if plan.old_home is not None and plan.old_home.resolve() != plan.folder.resolve():
+                record_path(plan.old_home, fid).unlink(missing_ok=True)
+            stats.unchanged += 1
+        except Exception:  # noqa: BLE001
+            stats.failed += 1
+
+    # ---- Hash new/stale videos, writing each record AS IT COMPLETES ----
+    # Incremental writes make the build resumable: a Ctrl+C (or crash) keeps
+    # every video hashed so far; a re-run hashes only what's left.
+    def _write_hashed(fid: str, features: list[FrameFeature]) -> None:
+        plan = plans[fid]
+        rec = assemble_record(plan.hash_path, fid, features, params,
+                              plan.stats_by_path[str(plan.hash_path.resolve())])
+        rec.paths = list(plan.paths)
+        rec.stat_by_path = dict(plan.stats_by_path)
+        save_record(rec, plan.folder)
+        location[fid] = plan.folder
+        if plan.old_home is not None and plan.old_home.resolve() != plan.folder.resolve():
+            record_path(plan.old_home, fid).unlink(missing_ok=True)
+        stats.added += 1 if plan.kind == "add" else 0
+        stats.updated += 1 if plan.kind == "update" else 0
+
+    to_hash = [(p.hash_path, fid) for fid, p in plans.items() if p.kind != "cached"]
+    done_fids: set[str] = set()
 
     if to_hash:
         bar = tqdm(total=len(to_hash), desc="hashing", unit="vid")
@@ -406,91 +476,82 @@ def sync(root: str | Path, params: HashParams,
             for path, fid in to_hash:
                 bar.set_postfix_str(path.name, refresh=True)
                 try:
-                    features_by_fid[fid] = hash_video(path, params, thread_count=1)
+                    feats = hash_video(path, params, thread_count=1)
+                    _write_hashed(fid, feats); done_fids.add(fid)
+                except KeyboardInterrupt:
+                    bar.close(); raise
                 except Exception:  # noqa: BLE001 - bad file, skip it
                     failed_fids.add(fid)
                 bar.update(1)
         else:
-            # With N workers, N files hash concurrently, so "the file being
-            # hashed" isn't single-valued; the bar's count IS the progress signal
-            # and the postfix shows the most recently completed file as context.
+            # N files hash concurrently, so "the file being hashed" isn't single-
+            # valued; the count is the progress signal, the postfix shows the most
+            # recently completed file as context.
             jobs = [(str(p), fid, params) for p, fid in to_hash]
+            pool = ProcessPoolExecutor(max_workers=workers)
             try:
-                with ProcessPoolExecutor(max_workers=workers) as pool:
-                    futures = {pool.submit(_hash_job, j): j[1] for j in jobs}
-                    for fut in as_completed(futures):
-                        job_fid = futures[fut]
+                futures = {pool.submit(_hash_job, j): j[1] for j in jobs}
+                for fut in as_completed(futures):
+                    job_fid = futures[fut]
+                    try:
+                        fid, path, features = fut.result()
+                    except BrokenProcessPool:
+                        # A worker died natively: the pool is dead and every
+                        # remaining future raises this too -> go to the fallback.
+                        raise
+                    except Exception:  # noqa: BLE001 - ordinary bad file, skip
+                        failed_fids.add(job_fid)
+                    else:
+                        # Writing the record can itself fail (disk full, perms).
+                        # Treat that like a failed file -- NOT an escape, which
+                        # would skip pool shutdown and leak/orphan the workers.
                         try:
-                            fid, path, features = fut.result()
-                            features_by_fid[fid] = features
+                            _write_hashed(fid, features)
+                            done_fids.add(fid)
                             bar.set_postfix_str(path.name, refresh=False)
-                        except BrokenProcessPool:
-                            # A worker died natively (segfault/OOM): the pool is
-                            # dead and EVERY remaining future will raise this too.
-                            # Don't mark this fid failed here -- propagate to the
-                            # fallback, which re-hashes all un-done jobs. (If we
-                            # swallowed it as a per-file failure, one native crash
-                            # would mark the whole remaining batch failed.)
-                            raise
-                        except Exception:  # noqa: BLE001 - ordinary bad file, skip
-                            failed_fids.add(job_fid)
-                        bar.update(1)
+                        except Exception:  # noqa: BLE001 - write failed, skip
+                            failed_fids.add(fid)
+                    bar.update(1)
+                pool.shutdown(wait=True)
             except KeyboardInterrupt:
-                pool.shutdown(wait=False, cancel_futures=True)
+                # Hard-kill in-flight workers so Ctrl+C returns promptly (their
+                # ffmpeg work is native and not otherwise cancellable), waiting so
+                # none are orphaned. Records written so far are already on disk;
+                # refresh the manifest to match them (so collection.json isn't
+                # left stale vs. the partially-written cache), then re-raise.
+                _shutdown_now(pool)
                 bar.close()
+                _write_manifest(root, params, location)
                 raise
             except BrokenProcessPool:
-                # Finish the jobs that never produced a result, single-process, so
-                # one bad file can't fail the whole batch. The file that actually
-                # crashed the worker will raise an ordinary exception on retry and
-                # be marked failed; the rest succeed.
-                done = set(features_by_fid) | failed_fids
-                leftover = [(Path(j[0]), j[1]) for j in jobs if j[1] not in done]
+                _shutdown_now(pool)
+                # Finish un-done jobs single-process so one bad file can't fail the
+                # whole batch; the crasher raises on retry and is marked failed.
+                leftover = [(Path(j[0]), j[1]) for j in jobs
+                            if j[1] not in done_fids and j[1] not in failed_fids]
                 for path, fid in leftover:
                     bar.set_postfix_str(path.name, refresh=True)
                     try:
-                        features_by_fid[fid] = hash_video(path, params, thread_count=1)
+                        feats = hash_video(path, params, thread_count=1)
+                        _write_hashed(fid, feats); done_fids.add(fid)
+                    except KeyboardInterrupt:
+                        bar.close(); raise
                     except Exception:  # noqa: BLE001 - this one is the bad apple
                         failed_fids.add(fid)
                     bar.update(1)
         bar.close()
 
-    # ---- Finalise: write one record per fid (main process only) ----
-    for fid, plan in plans.items():
-        if fid in failed_fids:
-            stats.failed += 1
-            continue
-        try:
-            if plan.kind == "cached":
-                # Copy, don't mutate the object held by `existing` (aliasing).
-                rec = replace(plan.cached_rec,
-                              paths=list(plan.paths),
-                              stat_by_path=dict(plan.stats_by_path))
-                stats.unchanged += 1
-            else:
-                feats = features_by_fid.get(fid)
-                if feats is None:            # shouldn't happen, but never crash
-                    stats.failed += 1
-                    continue
-                rec = assemble_record(plan.hash_path, fid, feats, params,
-                                      plan.stats_by_path[str(plan.hash_path.resolve())])
-                rec.paths = list(plan.paths)
-                rec.stat_by_path = dict(plan.stats_by_path)
-                stats.added += 1 if plan.kind == "add" else 0
-                stats.updated += 1 if plan.kind == "update" else 0
-
-            save_record(rec, plan.folder)
-            location[fid] = plan.folder
-            # If the record used to live elsewhere, drop the old file.
-            if plan.old_home is not None and plan.old_home.resolve() != plan.folder.resolve():
-                record_path(plan.old_home, fid).unlink(missing_ok=True)
-        except Exception:  # noqa: BLE001
-            stats.failed += 1
+    # Count bad files (hash or record-write failures) as failed. This runs only
+    # on a normal / BrokenProcessPool completion -- a KeyboardInterrupt re-raises
+    # above and never reaches here (so stats isn't returned on interrupt at all).
+    for fid in failed_fids:
+        stats.failed += 1
 
     # Remove record files for content no longer present, and collapse any
     # duplicate record files for seen content down to the chosen home folder.
-    # A fid is "present this run" iff it has a plan; location[fid] is set only
-    # when its record was successfully (re)written in finalise.
+    # A fid is "present this run" iff it has a plan AND got a record written
+    # (location[fid] is set only on a successful write; a not-yet-hashed fid
+    # under an interrupt has a plan but no location, so we leave its files alone).
     for fid, paths in all_record_files.items():
         home = location.get(fid)
         if fid not in plans:
