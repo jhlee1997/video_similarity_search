@@ -18,15 +18,16 @@ VIDEO_EXTS = {"mp4","mkv","webm","mov","avi","m4v","flv","wmv",
               "mpg","mpeg","ts","m2ts","3gp","ogv"}
 
 
-def duration(path: Path) -> float:
+def duration(path: Path, timeout: float = 10.0) -> float:
     """Seconds, read from container metadata (no decoding).
 
     Prefers the container-level duration; falls back to the longest stream
     duration when the container doesn't carry one. Returns 0.0 if neither is
-    available or the file can't be opened.
+    available, the file can't be opened, or the open exceeds *timeout* seconds
+    (a malformed/streaming file must not block the caller forever).
     """
     try:
-        with av.open(str(path)) as container:
+        with av.open(str(path), timeout=timeout) as container:
             if container.duration and container.duration > 0:
                 return container.duration / av.time_base
             best = 0.0
@@ -34,7 +35,7 @@ def duration(path: Path) -> float:
                 if stream.duration and stream.time_base:
                     best = max(best, float(stream.duration * stream.time_base))
             return best
-    except Exception:  # noqa: BLE001 - an unreadable file shouldn't abort the run
+    except Exception:  # noqa: BLE001 - an unreadable/slow file shouldn't abort the run
         return 0.0
 
 

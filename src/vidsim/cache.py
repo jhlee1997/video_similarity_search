@@ -14,7 +14,8 @@ import json
 import multiprocessing
 import os
 import queue as queue_mod
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -509,18 +510,51 @@ def sync(root: str | Path, params: HashParams,
 
     if to_hash:
         # Weight the overall bar by video DURATION so a long video owns a
-        # proportional share (not "1 of N"). For files we've hashed before, the
-        # exact duration is already stored in their prior record -- free. Only
-        # genuinely new files need a metadata read, via vid_length (the same path
-        # `vidsim duration` uses; reads container metadata, does not decode, and
-        # is proven not to hang). Unreadable -> tiny epsilon so it still advances.
+        # proportional share (not "1 of N").
+        #   - A file hashed before -> its exact duration is already in the record
+        #     (free, no open).
+        #   - A genuinely new file -> read duration once, in a bounded parallel
+        #     scan: a ThreadPoolExecutor so one wedged file ties up only ONE
+        #     thread (others finish), plus a 10s per-file av.open timeout so a
+        #     malformed file releases its thread instead of blocking forever.
+        #     This is why the old inline, serial, un-timed read hung the whole
+        #     build; the scan here cannot. Unreadable/timed-out -> size proxy.
         from .vid_length import duration as _video_duration
 
-        dur_by_fid: dict[str, float] = {}
-        for path, fid in to_hash:
+        new_items = [(path, fid) for path, fid in to_hash
+                     if not (existing.get(fid) and existing[fid][0].duration > 0)]
+        scanned: dict[str, float] = {}
+        if new_items:
+            ui.header("Reading durations", detail=f"{len(new_items)} new video(s)")
+            # Bounded scan. Each av.open gets a 10s timeout; on top of that we put
+            # a WHOLE-SCAN deadline and do NOT join wedged threads -- if a file
+            # defeats the per-open timeout (e.g. a demuxer spinning on CPU), its
+            # daemon thread is simply abandoned and that file falls back to the
+            # size proxy, so one pathological file can never block the build.
+            tp = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) * 2))
+            futs = {tp.submit(_video_duration, p): fid for p, fid in new_items}
+            deadline = time.monotonic() + 15.0 + 10.0 * len(new_items) / max(
+                1, tp._max_workers)  # generous: ~10s/file amortised over workers
+            with tqdm(total=len(futs), desc="durations", unit="vid") as dbar:
+                for fu in as_completed(futs, timeout=None):
+                    scanned[futs[fu]] = fu.result()
+                    dbar.update(1)
+                    if time.monotonic() > deadline:
+                        break  # abandon stragglers; they use the size fallback
+            # Don't wait on wedged threads; cancel what hasn't started.
+            tp.shutdown(wait=False, cancel_futures=True)
+
+        def _weight(path: Path, fid: str) -> float:
             prior = existing.get(fid)
-            d = prior[0].duration if (prior and prior[0].duration > 0) else _video_duration(path)
-            dur_by_fid[fid] = d if d > 0 else 0.01
+            if prior is not None and prior[0].duration > 0:
+                return prior[0].duration           # cached, free
+            d = scanned.get(fid, 0.0)
+            if d > 0:
+                return d                            # freshly scanned duration
+            sp = plans[fid].stats_by_path.get(str(path.resolve()))  # fallback
+            return max(0.01, sp[0] if sp else 0.0)  # size proxy for unreadable
+
+        dur_by_fid = {fid: _weight(path, fid) for path, fid in to_hash}
         total_units = sum(dur_by_fid.values())
 
         bars = ui.WorkerBars(total_units, len(to_hash),
