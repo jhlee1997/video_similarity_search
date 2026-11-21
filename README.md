@@ -113,21 +113,32 @@ first folder seen, with all its paths recorded.
 
 ---
 
-## ⚠️ Known limitation: near-static videos
+## ⚠️ Known limitation: static-background / low-motion videos
 
-Temporal alignment only means something if a video *changes over time*. A phone
-video of a mostly-still scene can have ~every frame look identical to every other
-frame. For such a video, a clip "aligns" at essentially every offset, and segment
-timings become meaningless.
+PDQ hashes a **whole frame as an image**. When most of the frame is an unchanging
+background and only a small region moves (a mostly-still phone video, or a fixed
+camera with people moving inside), two things break:
 
-This is **common in real phone footage** — in testing, two of four sample phone
-videos had 98–100% of their own frames mutually near-identical. On those, treat
-vidsim's segment timestamps with suspicion: a high coverage number still tells you
-the videos share content, but *where* is not reliable.
+- **Within a video**, nearly every frame hashes almost identically — in testing,
+  two of four sample phone videos had 98–100% of their own frames mutually
+  near-identical. A clip then "aligns" at essentially every time offset, so the
+  reported *segment timings become meaningless* (a high coverage number still
+  tells you the videos share content, but *where* is unreliable).
+- **Across videos**, two genuinely different clips shot against the *same*
+  background (same room, same angle) can be reported as matches, because the
+  shared backdrop dominates the hash — a potential **false positive**.
 
-> Per-video static-ness detection — flagging these and reporting "near-static,
-> timing can't be localized" instead of inventing segments — is a planned
-> improvement, not yet implemented.
+This is the inherent weak spot of whole-frame perceptual hashing. The
+industry-grade fix is to replace the per-frame **PDQ hash** with a learned
+**self-supervised embedding** (e.g. Meta's SSCD, the basis of the VSC'22 Video
+Similarity Challenge pipeline), which is trained to weight discriminative
+content over background. That is a heavier backend (PyTorch + a model, float
+indexes, ~64× the cache size, GPU-preferred), so it is **not** implemented here;
+vidsim deliberately stays a fast, CPU-friendly PDQ tool.
+
+> Planned lighter mitigations on the PDQ path: per-video static-ness detection
+> (flag "near-static — timing unreliable" instead of inventing segments), and
+> burstiness down-weighting. Not yet implemented.
 
 ---
 
@@ -239,9 +250,15 @@ predictor of build time**. Sum it quickly (metadata only, no decoding):
 uv run vidsim duration /path/to/your/videos
 ```
 
+It prints a summary to stderr and the raw total seconds to stdout (so the number
+is easy to capture, e.g. `uv run vidsim duration /videos 2>/dev/null`):
+
 ```
-1000 videos, 2 unreadable
-total: 182400s = 50h 40m 0s
+            videos : 1000
+        unreadable : 2
+    total duration : 50h 40m 0s
+           elapsed : 3.1s
+182400
 ```
 
 To turn that into a time estimate, measure your machine's throughput once — run
@@ -252,15 +269,28 @@ multiply by the figure above. The factor shrinks proportionally if you raise
 
 ### Progress & output streams
 
-Long-running commands (`cache-build`, `pairs`, `duration`) narrate their work: a
-header saying what's starting and the item count, a **self-updating progress bar**
-with a live count and ETA (for `cache-build`, the bar names the file currently
-being hashed, so a long pause reads as "hashing the big one", not a hang), and a
-summary of what completed / was skipped / failed.
+Long-running commands (`cache-build`, `pairs`, `duration`) narrate their work.
+For `cache-build` specifically, while hashing you see, on a terminal:
 
-All of that narration is written to **stderr**; the actual results — the report,
-or `--json` — go to **stdout**. So you can pipe or redirect results cleanly while
-still watching progress on screen:
+- a **library line** — how much of the whole collection is cached across runs,
+  e.g. `library: |███████░░░| 70%  700/1000 cached, 300 to hash this run`;
+- a **per-worker line for each parallel worker**, naming the file it is hashing
+  right now (so you can see real concurrent progress, and a long pause reads as
+  "worker 2 is on the big one", not a hang);
+- an **overall hashing bar weighted by video duration** (not file count), so a
+  2-hour video claims a proportionally large share instead of counting as "1 of
+  N" — the % reflects actual work, and the `files k/N` counter ticks per file.
+
+The per-run bar covers only the files hashed *this* run (cached files are
+excluded), so on a re-run it restarts at 0%; the **library line** is the
+cumulative "how close is my whole collection" view.
+
+All progress is driven entirely by the parent process (workers just hash and
+return — the display can never stall the build). It is written to **stderr**;
+the actual results — the report, or `--json` — go to **stdout**, so you can pipe
+or redirect results cleanly while still watching progress on screen. When stderr
+is not a terminal (piped/redirected), the per-worker lines are suppressed and
+only a single overall bar is shown.
 
 ```sh
 uv run vidsim pairs /videos --json > pairs.json   # progress on screen, clean JSON in the file
@@ -317,12 +347,13 @@ thousand hour-long videos is tens of millions of 256-bit hashes:
 src/vidsim/
   config.py      versioned hash params + tunable match params, cache paths
   fileid.py      content-based cache key (free exact-dup detection)
-  cache.py       per-video JSON records; incremental sync
+  cache.py       per-folder JSON records; incremental, parallel, resumable sync
   hashing.py     vpdq wrapper → (N, 32) uint8 frame-hash matrix
   index.py       FAISS binary index + row-map (row → file_id/frame/timestamp)
   aggregate.py   THE CORE: temporal Hough voting → shared segments
   report.py      directional % + segment list (text / JSON)
-  vid_length.py  parallel PyAV duration sum (runtime estimation)
+  vid_length.py  parallel PyAV duration reader (runtime estimate + bar weighting)
+  ui.py          parent-side progress bars + narration helpers (stderr only)
   cli.py         cache-build · index · find · pairs · duration
 ```
 
