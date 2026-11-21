@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import click
+from tqdm import tqdm
 
 from .aggregate import compare
 from .cache import (
@@ -31,6 +32,7 @@ from .config import (
     HashParams,
     MatchParams,
 )
+from . import ui
 from .fileid import file_id
 from .index import FrameIndex
 from .report import dump_json, format_result_line
@@ -65,24 +67,38 @@ def cache_build(collection: Path, seconds_per_hash: float, quality_floor: int,
                 reindex: bool, index_kind: str) -> None:
     """Hash every video under COLLECTION into the per-folder cache (incremental)."""
     root = resolve_collection_root(collection)
-    if root != collection.resolve():
-        click.echo(f"(attaching to existing collection at {root})")
     params = _hash_params(seconds_per_hash, quality_floor)
+
+    detail = f"collection: {root}"
+    if root != collection.resolve():
+        detail += "  (attached to existing collection)"
+    ui.header("Building cache", step=(1, 2), detail=detail)
     stats = sync(root, params)
-    click.echo(
-        f"added={stats.added} updated={stats.updated} unchanged={stats.unchanged} "
-        f"removed={stats.removed} duplicate-copies={stats.duplicate_copies} "
-        f"failed={stats.failed}"
-    )
+    ui.summary([
+        ("hashed (new)", stats.added),
+        ("rehashed", stats.updated),
+        ("unchanged", stats.unchanged),
+        ("duplicate copies", stats.duplicate_copies),
+        ("removed", stats.removed),
+        ("failed", stats.failed),
+    ])
+
     if reindex:
+        ui.header("Building index", step=(2, 2))
         _do_index(root, index_kind)
+    else:
+        ui.header("Index", step=(2, 2), detail="skipped (--no-reindex)")
 
 
 def _do_index(root: Path, kind: str) -> None:
     records = load_records(root)
     idx = FrameIndex.build(records, kind=kind)
     idx.save(root)
-    click.echo(f"index: {len(idx)} frames from {len(records)} videos ({kind})")
+    ui.summary([
+        ("index type", kind),
+        ("videos", len(records)),
+        ("frames", len(idx)),
+    ])
 
 
 def _resolve_for_read(collection: Path) -> Path:
@@ -111,6 +127,7 @@ def index_cmd(collection: Path, index_kind: str) -> None:
     # Attach to an existing collection root if COLLECTION is a subfolder, so we
     # never fragment one collection into two divergent indexes.
     root = resolve_collection_root(collection)
+    ui.header("Building index", detail=f"collection: {root}")
     _do_index(root, index_kind)
 
 
@@ -151,7 +168,13 @@ def find_cmd(video: Path, collection: Path, seconds_per_hash: float,
     # otherwise hash the query on the fly (don't persist -- find is a read).
     rec = records.get(fid)
     if rec is None or rec.is_stale(params):
+        if not as_json:
+            ui.header("Checking video against collection",
+                      detail=f"hashing {video.name} ({len(records)} videos in collection)")
         rec = build_record(video, fid, params)
+    elif not as_json:
+        ui.header("Checking video against collection",
+                  detail=f"{video.name} (cached) vs {len(records)} videos")
 
     results = [r for r in compare(rec, idx, mp, records)
                if r.coverage >= mp.report_coverage]
@@ -196,13 +219,27 @@ def pairs_cmd(collection: Path, frame_radius: int | None,
         report_coverage=min_coverage,
     )
 
+    if not as_json:
+        ui.header("Scanning for related pairs",
+                  detail=f"{len(records)} videos in {root}")
+
     collected = []
-    for fid, rec in records.items():
+    # Self-updating bar on stderr (suppressed for --json so machine output stays
+    # clean). Live postfix shows how many related pairs found so far.
+    bar = tqdm(records.items(), total=len(records), desc="comparing",
+               unit="vid", disable=as_json)
+    for fid, rec in bar:
         for r in compare(rec, idx, mp, records):
             if r.coverage >= mp.report_coverage:
                 collected.append(r)
+        bar.set_postfix_str(f"{len(collected)} pairs", refresh=False)
+    bar.close()
 
     collected.sort(key=lambda r: r.coverage, reverse=True)
+    if not as_json:
+        ui.summary([("videos scanned", len(records)),
+                    ("related pairs", len(collected))])
+        click.echo(err=True)  # clean blank line before the report on stdout
 
     if as_json:
         click.echo(dump_json(collected, records))
@@ -224,10 +261,15 @@ def duration_cmd(collection: Path) -> None:
     """
     from .vid_length import total_duration
 
-    total, count, failed = total_duration(collection)
-    h = int(total // 3600); m = int((total % 3600) // 60); s = int(total % 60)
-    click.echo(f"{count} videos, {failed} unreadable")
-    click.echo(f"total: {total:.0f}s = {h}h {m}m {s}s")
+    ui.header("Summing video durations", detail=f"collection: {collection}")
+    total, count, failed = total_duration(collection, progress=True)
+    ui.summary([
+        ("videos", count),
+        ("unreadable", failed),
+        ("total duration", ui.hms(total)),
+    ])
+    # The machine-usable result goes to stdout so it can be piped/captured.
+    click.echo(f"{total:.0f}")
 
 
 def main() -> None:

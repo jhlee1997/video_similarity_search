@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import av
+from tqdm import tqdm
 
 VIDEO_EXTS = {"mp4","mkv","webm","mov","avi","m4v","flv","wmv",
               "mpg","mpeg","ts","m2ts","3gp","ogv"}
@@ -37,10 +38,12 @@ def duration(path: Path) -> float:
         return 0.0
 
 
-def total_duration(root: str | Path) -> tuple[float, int, int]:
+def total_duration(root: str | Path,
+                   progress: bool = False) -> tuple[float, int, int]:
     """Sum durations of all videos under *root*. Returns (seconds, count, failed).
 
-    Reads container metadata in parallel; no frame decoding.
+    Reads container metadata in parallel; no frame decoding. When *progress* is
+    true, shows a self-updating bar with a running total.
     """
     workers = min(32, (os.cpu_count() or 4) * 2)
     paths = [
@@ -49,12 +52,18 @@ def total_duration(root: str | Path) -> tuple[float, int, int]:
     ]
     total, count, failed = 0.0, 0, 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for d in pool.map(duration, paths):
+        results = pool.map(duration, paths)
+        bar = tqdm(results, total=len(paths), desc="reading durations",
+                   unit="vid", disable=not progress)
+        for d in bar:
             if d > 0:
                 total += d
                 count += 1
             else:
                 failed += 1
+            if progress:
+                bar.set_postfix_str(f"{total/3600:.1f}h so far", refresh=False)
+        bar.close()
     return total, count, failed
 
 

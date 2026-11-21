@@ -273,7 +273,8 @@ def sync(root: str | Path, params: HashParams) -> SyncStats:
     location: dict[str, Path] = {}                 # fid -> folder its record lives in
 
     files = list(iter_video_files(root))
-    for path in tqdm(files, desc="scanning", unit="vid"):
+    bar = tqdm(files, desc="scanning", unit="vid")
+    for path in bar:
         try:
             fid = file_id(path)
         except OSError:
@@ -295,12 +296,17 @@ def sync(root: str | Path, params: HashParams) -> SyncStats:
             seen_ids.add(fid)
             prior = existing.get(fid)
             if prior is None:
+                # New content: this is where the time goes (ffmpeg decode + hash).
+                # Surface the file so a long pause reads as "hashing the big one",
+                # not a hang.
+                bar.set_postfix_str(f"hashing {path.name}", refresh=True)
                 rec = build_record(path, fid, params)
                 save_record(rec, folder)
                 stats.added += 1
             else:
                 old_rec, old_home = prior
                 if old_rec.is_stale(params):
+                    bar.set_postfix_str(f"rehashing {path.name}", refresh=True)
                     rec = build_record(path, fid, params)  # paths reset to [rp]
                     stats.updated += 1
                 else:

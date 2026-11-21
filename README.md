@@ -244,9 +244,27 @@ total duration to get a *seconds-of-build per second-of-video* factor, then
 multiply by the figure above. The factor shrinks proportionally if you raise
 `--seconds-per-hash` (fewer frames hashed) and grows if you lower it.
 
+### Progress & output streams
+
+Long-running commands (`cache-build`, `pairs`, `duration`) narrate their work: a
+header saying what's starting and the item count, a **self-updating progress bar**
+with a live count and ETA (for `cache-build`, the bar names the file currently
+being hashed, so a long pause reads as "hashing the big one", not a hang), and a
+summary of what completed / was skipped / failed.
+
+All of that narration is written to **stderr**; the actual results — the report,
+or `--json` — go to **stdout**. So you can pipe or redirect results cleanly while
+still watching progress on screen:
+
+```sh
+uv run vidsim pairs /videos --json > pairs.json   # progress on screen, clean JSON in the file
+uv run vidsim duration /videos 2>/dev/null         # prints just the total seconds
+```
+
 ### Machine-readable output
 
-Both `find` and `pairs` accept `--json` for scripting a review/dedup workflow.
+Both `find` and `pairs` accept `--json` for scripting a review/dedup workflow
+(`--json` also suppresses the progress bar so stdout stays pure JSON).
 
 ---
 
