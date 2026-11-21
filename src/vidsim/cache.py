@@ -14,7 +14,7 @@ import json
 import multiprocessing
 import os
 import queue as queue_mod
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -236,22 +236,38 @@ def _hash_job(args: tuple[str, str, HashParams]) -> tuple[str, Path, list[FrameF
     return fid, Path(path_str), features
 
 
+# Per-worker queues are handed to each worker process once, at pool start, via
+# the executor initializer -- NOT via a multiprocessing.Manager (its server
+# process can deadlock the parent handshake on macOS spawn: scan done, hashing
+# never starts, CPU idle). They live as module globals in the worker process.
+_SLOT_Q = None
+_STATUS_Q = None
+
+
+def _init_worker(slot_q, status_q) -> None:
+    """ProcessPoolExecutor initializer: stash the queues as worker globals."""
+    global _SLOT_Q, _STATUS_Q
+    _SLOT_Q, _STATUS_Q = slot_q, status_q
+
+
 def _hash_job_reporting(args) -> tuple[str, Path, list[FrameFeature]]:
-    """Like _hash_job, but reports start/done to the parent for live per-worker
-    progress bars. Claims a free bar-slot index, announces the file it's about to
-    hash, and releases the slot when done -- even on failure (finally), so a bad
-    file never permanently occupies a worker line. Workers only SEND events; the
-    parent owns all drawing.
+    """Like _hash_job, but reports start/done over the worker-global queues for
+    live per-worker progress bars. Claims a free bar-slot, announces the file,
+    releases the slot in a finally so a bad file never permanently occupies a
+    worker line. Workers only SEND events; the parent owns all drawing. If the
+    queues aren't set (shouldn't happen), degrade to plain hashing.
     """
-    path_str, fid, params, slot_q, status_q = args
-    slot = slot_q.get()  # blocks until a slot is free (always is: one per worker)
+    path_str, fid, params = args
+    if _SLOT_Q is None or _STATUS_Q is None:
+        return fid, Path(path_str), hash_video(path_str, params, thread_count=1)
+    slot = _SLOT_Q.get()  # blocks until a slot is free (always is: one per worker)
     try:
-        status_q.put(("start", slot, fid, Path(path_str).name))
+        _STATUS_Q.put(("start", slot, fid, Path(path_str).name))
         features = hash_video(path_str, params, thread_count=1)
         return fid, Path(path_str), features
     finally:
-        status_q.put(("done", slot, fid, ""))
-        slot_q.put(slot)
+        _STATUS_Q.put(("done", slot, fid, ""))
+        _SLOT_Q.put(slot)
 
 
 @dataclass
@@ -492,16 +508,19 @@ def sync(root: str | Path, params: HashParams,
     done_fids: set[str] = set()
 
     if to_hash:
-        # Duration pre-scan (metadata only, parallel) so the overall bar is
-        # weighted by video length, not file count -- a 2h file owns a
-        # proportional share. Reuses vid_length.durations_for. Unreadable files
-        # (0.0) get a tiny epsilon so they still advance and total is never 0;
-        # real (incl. sub-second) durations are kept as-is.
-        from .vid_length import durations_for
+        # Weight the overall bar by video DURATION so a long video owns a
+        # proportional share (not "1 of N"). For files we've hashed before, the
+        # exact duration is already stored in their prior record -- free. Only
+        # genuinely new files need a metadata read, via vid_length (the same path
+        # `vidsim duration` uses; reads container metadata, does not decode, and
+        # is proven not to hang). Unreadable -> tiny epsilon so it still advances.
+        from .vid_length import duration as _video_duration
 
-        scan = durations_for([p for p, _ in to_hash])
-        dur_by_fid = {fid: (d if d > 0 else 0.01)
-                      for (p, fid), d in zip(to_hash, scan)}
+        dur_by_fid: dict[str, float] = {}
+        for path, fid in to_hash:
+            prior = existing.get(fid)
+            d = prior[0].duration if (prior and prior[0].duration > 0) else _video_duration(path)
+            dur_by_fid[fid] = d if d > 0 else 0.01
         total_units = sum(dur_by_fid.values())
 
         bars = ui.WorkerBars(total_units, len(to_hash),
@@ -521,9 +540,12 @@ def sync(root: str | Path, params: HashParams,
                 bars.advance(dur_by_fid[fid])
         else:
             jobs = [(str(p), fid, params) for p, fid in to_hash]
-            manager = multiprocessing.Manager()
-            slot_q = manager.Queue()
-            status_q = manager.Queue()
+            # Plain spawn-context queues handed to workers via the pool
+            # initializer -- NO multiprocessing.Manager (its server process can
+            # deadlock the parent on macOS spawn: scan done, hashing never starts).
+            ctx = multiprocessing.get_context("spawn")
+            slot_q = ctx.Queue()
+            status_q = ctx.Queue()
             for k in range(workers):
                 slot_q.put(k)
 
@@ -542,8 +564,8 @@ def sync(root: str | Path, params: HashParams,
                         kind, slot, _fid, name = status_q.get(timeout=0.2)
                     except queue_mod.Empty:
                         continue
-                    except (EOFError, OSError, BrokenPipeError):
-                        return  # manager/queue torn down
+                    except (EOFError, OSError, BrokenPipeError, ValueError):
+                        return  # queue closed / torn down
                     if kind == "start":
                         bars.on_start(slot, name)
                     else:
@@ -556,11 +578,29 @@ def sync(root: str | Path, params: HashParams,
                 stop_drain.set()
                 drain.join(timeout=2)
 
-            pool = ProcessPoolExecutor(max_workers=workers)
+            def _close_queues(graceful: bool) -> None:
+                # Plain spawn Queues have a background feeder thread that must be
+                # released, or it can delay interpreter exit (the Manager used to
+                # do this for us). On a hard teardown (workers SIGKILLed mid-put),
+                # a feeder may hold the write lock -- cancel_join_thread() drops
+                # the buffered bytes instead of blocking on it.
+                for q in (slot_q, status_q):
+                    try:
+                        if not graceful:
+                            q.cancel_join_thread()
+                        q.close()
+                        if graceful:
+                            q.join_thread()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            pool = ProcessPoolExecutor(
+                max_workers=workers, mp_context=ctx,
+                initializer=_init_worker, initargs=(slot_q, status_q),
+            )
             try:
                 futures = {
-                    pool.submit(_hash_job_reporting,
-                                (path_str, fid, job_params, slot_q, status_q)): fid
+                    pool.submit(_hash_job_reporting, (path_str, fid, job_params)): fid
                     for path_str, fid, job_params in jobs
                 }
                 for fut in as_completed(futures):
@@ -581,23 +621,21 @@ def sync(root: str | Path, params: HashParams,
                         bars.advance(dur_by_fid[fid])
                 pool.shutdown(wait=True)
                 _stop_drain()
-                manager.shutdown()
+                _close_queues(graceful=True)
             except KeyboardInterrupt:
                 # Hard-kill in-flight workers so Ctrl+C returns promptly; records
-                # written so far are already on disk. Stop the drain thread and
-                # tear down the manager so neither is orphaned, refresh manifest.
+                # written so far are already on disk. Stop the drain thread so it
+                # isn't orphaned, release the queues, refresh manifest.
                 _shutdown_now(pool)
                 _stop_drain()
-                try: manager.shutdown()
-                except Exception: pass  # noqa: BLE001,E701
+                _close_queues(graceful=False)
                 bars.close()
                 _write_manifest(root, params, location)
                 raise
             except BrokenProcessPool:
                 _shutdown_now(pool)
                 _stop_drain()                 # no more queue events will come
-                try: manager.shutdown()
-                except Exception: pass  # noqa: BLE001,E701
+                _close_queues(graceful=False)
                 bars.idle_all()               # killed workers never sent "done"
                 # Finish un-done jobs single-process so one bad file can't fail the
                 # whole batch; the crasher raises on retry and is marked failed.

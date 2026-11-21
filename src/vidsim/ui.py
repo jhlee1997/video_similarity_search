@@ -103,8 +103,10 @@ class WorkerBars:
         # a zero total (e.g. all-unreadable durations) so tqdm still renders.
         self._total = max(1.0, float(total_units))
         self._progress = 0.0
+        # Duration-weighted bar (weight = video seconds). The raw unit isn't
+        # shown; bar_format gives percentage + the files counter only.
         self.overall = tqdm(
-            total=self._total, position=0, desc="hashing", unit="s",
+            total=self._total, position=0, desc="hashing",
             unit_scale=False, leave=True,
             bar_format="{desc}: {percentage:3.0f}%|{bar}| {postfix}",
         )
