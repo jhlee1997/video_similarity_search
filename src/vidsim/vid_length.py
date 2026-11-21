@@ -38,6 +38,19 @@ def duration(path: Path) -> float:
         return 0.0
 
 
+def durations_for(paths: list[Path]) -> list[float]:
+    """Read each path's duration in parallel (metadata only, no decoding).
+
+    Returns a list aligned with *paths*; unreadable files yield 0.0. Shared by
+    `total_duration` and by cache-build's duration-weighted progress bar.
+    """
+    if not paths:
+        return []
+    workers = min(32, (os.cpu_count() or 4) * 2)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(duration, paths))
+
+
 def total_duration(root: str | Path,
                    progress: bool = False) -> tuple[float, int, int]:
     """Sum durations of all videos under *root*. Returns (seconds, count, failed).
