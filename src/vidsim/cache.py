@@ -12,13 +12,19 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ProcessPoolExecutor,
+    as_completed,
+    wait,
+)
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from tqdm import tqdm
 
+from . import ui
 from .config import (
     SCHEMA_VERSION,
     VIDEO_EXTS,
@@ -334,6 +340,88 @@ def _shutdown_now(pool: ProcessPoolExecutor) -> None:
         pass
 
 
+def _hash_parallel(to_hash, params, workers, weight_by_fid, bars,
+                   write_hashed, done_fids, failed_fids, refresh_manifest) -> None:
+    """Hash `to_hash` across a process pool with a BOUNDED-submission loop.
+
+    Keeps exactly `workers` futures in flight, each pinned to a display slot, so
+    the parent knows which file occupies which per-worker line WITHOUT any worker
+    cooperation (workers run the plain `_hash_job`). Records are written as each
+    future completes (resumable). Ctrl+C hard-kills workers; a native worker crash
+    (BrokenProcessPool) falls back to finishing the rest single-process.
+    """
+    queue = list(to_hash)           # (path, fid) still to submit
+    qi = 0
+    free_slots = list(range(min(workers, len(queue))))
+    slot_of: dict = {}              # future -> display slot
+    fid_of: dict = {}               # future -> fid
+    advanced_fids: set = set()      # fids already counted on the bar (no double-count)
+    pending: set = set()
+
+    pool = ProcessPoolExecutor(max_workers=workers)
+
+    def _submit_next() -> None:
+        nonlocal qi
+        if qi >= len(queue) or not free_slots:
+            return
+        path, fid = queue[qi]; qi += 1
+        slot = free_slots.pop()
+        fut = pool.submit(_hash_job, (str(path), fid, params))
+        slot_of[fut] = slot; fid_of[fut] = fid
+        pending.add(fut)
+        bars.set_slot(slot, path.name)
+
+    try:
+        for _ in range(min(workers, len(queue))):
+            _submit_next()
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                fid = fid_of[fut]; slot = slot_of[fut]
+                try:
+                    r_fid, _path, features = fut.result()
+                except BrokenProcessPool:
+                    raise
+                except Exception:  # noqa: BLE001 - ordinary bad file, skip
+                    failed_fids.add(fid)
+                else:
+                    try:
+                        write_hashed(r_fid, features)
+                        done_fids.add(r_fid)
+                    except Exception:  # noqa: BLE001 - write failed (disk/perms)
+                        failed_fids.add(r_fid)
+                bars.clear_slot(slot)
+                bars.advance(weight_by_fid[fid]); advanced_fids.add(fid)
+                free_slots.append(slot)
+                _submit_next()      # refill this freed slot
+        pool.shutdown(wait=True)
+        bars.finish(); bars.close()
+    except KeyboardInterrupt:
+        _shutdown_now(pool)
+        bars.close()
+        refresh_manifest()
+        raise
+    except BrokenProcessPool:
+        _shutdown_now(pool)
+        # Finish everything not yet done, single-process, so one native crash
+        # can't fail the whole batch; the crasher raises on retry -> marked failed.
+        remaining = [(p, f) for p, f in to_hash
+                     if f not in done_fids and f not in failed_fids]
+        for path, fid in remaining:
+            bars.set_slot(0, path.name)
+            try:
+                feats = hash_video(path, params, thread_count=1)
+                write_hashed(fid, feats); done_fids.add(fid)
+            except KeyboardInterrupt:
+                bars.close(); refresh_manifest(); raise
+            except Exception:  # noqa: BLE001
+                failed_fids.add(fid)
+            bars.clear_slot(0)
+            if fid not in advanced_fids:   # don't double-count a file already advanced
+                bars.advance(weight_by_fid[fid]); advanced_fids.add(fid)
+        bars.finish(); bars.close()
+
+
 def sync(root: str | Path, params: HashParams,
          workers: int | None = None) -> SyncStats:
     """Reconcile the per-folder cache with the videos currently under *root*.
@@ -471,75 +559,56 @@ def sync(root: str | Path, params: HashParams,
     done_fids: set[str] = set()
 
     if to_hash:
-        bar = tqdm(total=len(to_hash), desc="hashing", unit="vid")
+        # --- Progress weight per file (DURATION), computed parent-side, no worker
+        # involvement. Cached files use their stored duration (free). New files
+        # get a bounded, timed-out parallel metadata read (can't hang); any that
+        # don't answer fall back to file size from the Phase-1 stat. ---
+        weight_by_fid: dict[str, float] = {}
+        # Scan any file WITHOUT a usable cached duration -- brand-new OR a prior
+        # record that carries no duration. (A file with a good cached duration
+        # reuses it for free.) Show a bar: the scan can take a bit on a large new
+        # collection, and a silent gap here would look like a hang.
+        def _has_cached_dur(fid: str) -> bool:
+            p = existing.get(fid)
+            return p is not None and p[0].duration > 0
+
+        scan_paths = [path for path, fid in to_hash if not _has_cached_dur(fid)]
+        scanned: dict[str, float] = {}
+        if scan_paths:
+            from .vid_length import durations_for
+            ui.header("Reading durations", detail=f"{len(scan_paths)} video(s)")
+            scanned = durations_for(scan_paths, progress=True)  # {resolved-path: s}
+        for path, fid in to_hash:
+            if _has_cached_dur(fid):
+                w = existing[fid][0].duration                # cached duration
+            else:
+                w = scanned.get(str(path.resolve()), 0.0)    # fresh scan
+                if w <= 0:                                   # unreadable -> size
+                    sp = plans[fid].stats_by_path.get(str(path.resolve()))
+                    w = sp[0] if sp else 0.0
+            weight_by_fid[fid] = max(0.01, w)
+        total_units = sum(weight_by_fid.values())
+
+        bars = ui.WorkerBars(total_units, len(to_hash),
+                             workers if workers > 1 else 0)
+
         if workers == 1:
             for path, fid in to_hash:
-                bar.set_postfix_str(path.name, refresh=True)
+                bars.set_slot(0, path.name)
                 try:
                     feats = hash_video(path, params, thread_count=1)
                     _write_hashed(fid, feats); done_fids.add(fid)
                 except KeyboardInterrupt:
-                    bar.close(); raise
+                    bars.close(); _write_manifest(root, params, location); raise
                 except Exception:  # noqa: BLE001 - bad file, skip it
                     failed_fids.add(fid)
-                bar.update(1)
+                bars.clear_slot(0)
+                bars.advance(weight_by_fid[fid])
+            bars.finish(); bars.close()
         else:
-            # N files hash concurrently, so "the file being hashed" isn't single-
-            # valued; the count is the progress signal, the postfix shows the most
-            # recently completed file as context.
-            jobs = [(str(p), fid, params) for p, fid in to_hash]
-            pool = ProcessPoolExecutor(max_workers=workers)
-            try:
-                futures = {pool.submit(_hash_job, j): j[1] for j in jobs}
-                for fut in as_completed(futures):
-                    job_fid = futures[fut]
-                    try:
-                        fid, path, features = fut.result()
-                    except BrokenProcessPool:
-                        # A worker died natively: the pool is dead and every
-                        # remaining future raises this too -> go to the fallback.
-                        raise
-                    except Exception:  # noqa: BLE001 - ordinary bad file, skip
-                        failed_fids.add(job_fid)
-                    else:
-                        # Writing the record can itself fail (disk full, perms).
-                        # Treat that like a failed file -- NOT an escape, which
-                        # would skip pool shutdown and leak/orphan the workers.
-                        try:
-                            _write_hashed(fid, features)
-                            done_fids.add(fid)
-                            bar.set_postfix_str(path.name, refresh=False)
-                        except Exception:  # noqa: BLE001 - write failed, skip
-                            failed_fids.add(fid)
-                    bar.update(1)
-                pool.shutdown(wait=True)
-            except KeyboardInterrupt:
-                # Hard-kill in-flight workers so Ctrl+C returns promptly (their
-                # ffmpeg work is native and not otherwise cancellable), waiting so
-                # none are orphaned. Records written so far are already on disk;
-                # refresh the manifest to match them (so collection.json isn't
-                # left stale vs. the partially-written cache), then re-raise.
-                _shutdown_now(pool)
-                bar.close()
-                _write_manifest(root, params, location)
-                raise
-            except BrokenProcessPool:
-                _shutdown_now(pool)
-                # Finish un-done jobs single-process so one bad file can't fail the
-                # whole batch; the crasher raises on retry and is marked failed.
-                leftover = [(Path(j[0]), j[1]) for j in jobs
-                            if j[1] not in done_fids and j[1] not in failed_fids]
-                for path, fid in leftover:
-                    bar.set_postfix_str(path.name, refresh=True)
-                    try:
-                        feats = hash_video(path, params, thread_count=1)
-                        _write_hashed(fid, feats); done_fids.add(fid)
-                    except KeyboardInterrupt:
-                        bar.close(); raise
-                    except Exception:  # noqa: BLE001 - this one is the bad apple
-                        failed_fids.add(fid)
-                    bar.update(1)
-        bar.close()
+            _hash_parallel(to_hash, params, workers, weight_by_fid, bars,
+                           _write_hashed, done_fids, failed_fids,
+                           lambda: _write_manifest(root, params, location))
 
     # Count bad files (hash or record-write failures) as failed. This runs only
     # on a normal / BrokenProcessPool completion -- a KeyboardInterrupt re-raises

@@ -67,3 +67,99 @@ def note(msg: str) -> None:
 
 def is_tty() -> bool:
     return sys.stderr.isatty()
+
+
+_SLOT_CAP = 16  # max per-worker lines drawn, so a huge --workers can't overflow
+
+
+class WorkerBars:
+    """Parent-side progress for parallel hashing: a duration-weighted overall bar
+    plus, on a TTY, one status line per worker slot showing the file it's hashing.
+
+    IMPORTANT: this is a pure *observer*. It is driven entirely by the parent
+    process from its own bookkeeping; workers never touch it. Every public method
+    swallows its own errors so a drawing glitch can NEVER propagate into the build
+    (functionality always wins). Only the parent thread calls these -- no locking
+    needed.
+    """
+
+    def __init__(self, total_units: float, n_files: int, workers: int,
+                 enabled: bool | None = None):
+        from tqdm import tqdm
+
+        self.n_files = n_files
+        self.done_files = 0
+        self.enabled = is_tty() if enabled is None else enabled
+        self._total = max(1.0, float(total_units))
+        self._progress = 0.0
+        self.overall = None
+        self.slots: list = []
+        try:
+            self.overall = tqdm(
+                total=self._total, position=0, desc="hashing",
+                unit_scale=False, leave=True,
+                bar_format="{desc}: {percentage:3.0f}%|{bar}| {postfix}",
+            )
+            self._set_postfix()
+            if self.enabled:
+                for k in range(min(workers, _SLOT_CAP)):
+                    s = tqdm(total=0, position=k + 1, bar_format="{desc}",
+                             leave=False)
+                    s.set_description_str(f"  worker {k}: idle")
+                    self.slots.append(s)
+        except Exception:  # noqa: BLE001 - display must never break the build
+            pass
+
+    def _set_postfix(self) -> None:
+        if self.overall is not None:
+            self.overall.set_postfix_str(f"files {self.done_files}/{self.n_files}",
+                                         refresh=True)
+
+    def set_slot(self, slot: int, name: str) -> None:
+        try:
+            if 0 <= slot < len(self.slots):
+                self.slots[slot].set_description_str(f"  worker {slot}: {name}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def clear_slot(self, slot: int) -> None:
+        try:
+            if 0 <= slot < len(self.slots):
+                self.slots[slot].set_description_str(f"  worker {slot}: idle")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def advance(self, weight: float) -> None:
+        """One file finished: advance the overall bar by its weight, clamped so
+        float summation can't exceed 100%."""
+        try:
+            self.done_files += 1
+            step = max(0.0, float(weight))
+            if self._progress + step > self._total:
+                step = max(0.0, self._total - self._progress)
+            self._progress += step
+            if self.overall is not None:
+                self.overall.update(step)
+            self._set_postfix()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def finish(self) -> None:
+        try:
+            if self.overall is not None and self._progress < self._total:
+                self.overall.update(self._total - self._progress)
+                self._progress = self._total
+        except Exception:  # noqa: BLE001
+            pass
+
+    def close(self) -> None:
+        for s in self.slots:
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            if self.overall is not None:
+                self.overall.close()
+        except Exception:  # noqa: BLE001
+            pass
