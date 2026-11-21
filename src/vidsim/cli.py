@@ -13,6 +13,7 @@ The cache lives WITH the videos (per-folder .vidsim/); only cache-build writes.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -63,8 +64,10 @@ def cli() -> None:
               help="Rebuild the FAISS index after syncing.")
 @click.option("--index-kind", default="flat", type=click.Choice(["flat", "hnsw"]),
               show_default=True)
+@click.option("--workers", type=int, default=None,
+              help="Parallel hashing workers (default: CPU count - 3).")
 def cache_build(collection: Path, seconds_per_hash: float, quality_floor: int,
-                reindex: bool, index_kind: str) -> None:
+                reindex: bool, index_kind: str, workers: int | None) -> None:
     """Hash every video under COLLECTION into the per-folder cache (incremental)."""
     root = resolve_collection_root(collection)
     params = _hash_params(seconds_per_hash, quality_floor)
@@ -73,15 +76,22 @@ def cache_build(collection: Path, seconds_per_hash: float, quality_floor: int,
     if root != collection.resolve():
         detail += "  (attached to existing collection)"
     ui.header("Building cache", step=(1, 2), detail=detail)
-    stats = sync(root, params)
-    ui.summary([
+    t0 = time.perf_counter()
+    stats = sync(root, params, workers=workers)
+    dt = time.perf_counter() - t0
+    hashed = stats.added + stats.updated
+    rows = [
         ("hashed (new)", stats.added),
         ("rehashed", stats.updated),
         ("unchanged", stats.unchanged),
         ("duplicate copies", stats.duplicate_copies),
         ("removed", stats.removed),
         ("failed", stats.failed),
-    ])
+        ("elapsed", ui.elapsed(dt)),
+    ]
+    if hashed and dt > 0:
+        rows.append(("throughput", f"{hashed / dt * 60:.0f} videos/min"))
+    ui.summary(rows)
 
     if reindex:
         ui.header("Building index", step=(2, 2))
@@ -226,6 +236,7 @@ def pairs_cmd(collection: Path, frame_radius: int | None,
     collected = []
     # Self-updating bar on stderr (suppressed for --json so machine output stays
     # clean). Live postfix shows how many related pairs found so far.
+    t0 = time.perf_counter()
     bar = tqdm(records.items(), total=len(records), desc="comparing",
                unit="vid", disable=as_json)
     for fid, rec in bar:
@@ -234,11 +245,13 @@ def pairs_cmd(collection: Path, frame_radius: int | None,
                 collected.append(r)
         bar.set_postfix_str(f"{len(collected)} pairs", refresh=False)
     bar.close()
+    dt = time.perf_counter() - t0
 
     collected.sort(key=lambda r: r.coverage, reverse=True)
     if not as_json:
         ui.summary([("videos scanned", len(records)),
-                    ("related pairs", len(collected))])
+                    ("related pairs", len(collected)),
+                    ("elapsed", ui.elapsed(dt))])
         click.echo(err=True)  # clean blank line before the report on stdout
 
     if as_json:
@@ -262,11 +275,14 @@ def duration_cmd(collection: Path) -> None:
     from .vid_length import total_duration
 
     ui.header("Summing video durations", detail=f"collection: {collection}")
+    t0 = time.perf_counter()
     total, count, failed = total_duration(collection, progress=True)
+    dt = time.perf_counter() - t0
     ui.summary([
         ("videos", count),
         ("unreadable", failed),
         ("total duration", ui.hms(total)),
+        ("elapsed", ui.elapsed(dt)),
     ])
     # The machine-usable result goes to stdout so it can be piped/captured.
     click.echo(f"{total:.0f}")

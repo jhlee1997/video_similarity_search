@@ -181,6 +181,12 @@ files that disappeared, and otherwise reuses what's cached.
 uv run vidsim cache-build /path/to/your/videos
 ```
 
+Hashing of new/changed videos runs **in parallel** across worker processes
+(default: ~3/4 of your cores), so a first build of a large collection is several
+times faster than serial. Re-runs are near-instant: an unchanged file is
+recognised by its path + size + mtime and skipped without re-reading it. Use
+`--workers N` to raise this for an idle machine or lower it to reduce load.
+
 (Pointing it at a subfolder of an existing collection attaches to that collection
 rather than starting a new one.)
 
@@ -280,6 +286,7 @@ Defaults live in `src/vidsim/config.py`; the common ones are also CLI flags.
 | `--min-coverage` | `0.15` | Only report a pair if a direction reaches this coverage. |
 | `--min-shared-frames` | `4` | A pair needs this many candidate frame matches before it's scored at all (prunes the all-pairs scan). |
 | `--index-kind` | `flat` | `flat` = exact Hamming search (`IndexBinaryFlat`); `hnsw` = approximate, much faster at tens of millions of frames. The cache is unaffected, so you can switch freely. |
+| `--workers` | ~¾ of cores | (`cache-build`) Parallel hashing worker processes. Higher saturates the CPU; `1` forces serial. Each worker pins ffmpeg to one thread to avoid oversubscription. |
 
 Internal knobs not exposed as flags (edit `config.py`):
 `offset_tolerance_s` (offset bin width, absorbs re-encode jitter) and

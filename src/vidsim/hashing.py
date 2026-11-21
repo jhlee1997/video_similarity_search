@@ -43,11 +43,19 @@ class FrameFeature:
         )
 
 
-def hash_video(path: str | Path, params: HashParams) -> list[FrameFeature]:
-    """Compute PDQ frame hashes for *path*, filtered by the quality floor."""
+def hash_video(path: str | Path, params: HashParams,
+               thread_count: int = 0) -> list[FrameFeature]:
+    """Compute PDQ frame hashes for *path*, filtered by the quality floor.
+
+    thread_count is passed to vpdq/ffmpeg: 0 (default) lets ffmpeg pick, which is
+    right for a single-process run. When hashing is fanned out over a process
+    pool, pass 1 so N worker processes don't each spawn N ffmpeg threads and
+    oversubscribe the CPU.
+    """
     features = vpdq.computeHash(
         str(path),
         seconds_per_hash=params.seconds_per_hash,
+        thread_count=thread_count,
     )
     out: list[FrameFeature] = []
     for f in features:

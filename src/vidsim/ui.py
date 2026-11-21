@@ -29,6 +29,18 @@ def hms(seconds: float) -> str:
     return f"{h}h {m}m {s}s"
 
 
+def elapsed(seconds: float) -> str:
+    """Compact elapsed time: '3.4s', '4m 12s', or '1h 4m 12s'."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    secs = int(round(seconds))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    return f"{m}m {s}s"
+
+
 def header(title: str, *, step: tuple[int, int] | None = None,
            detail: str = "") -> None:
     """Announce a phase. Optionally '[1/2]' step framing and a detail line."""
