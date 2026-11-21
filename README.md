@@ -80,12 +80,36 @@ scenes can't stuff a single bin.
 This is the standard *video copy localization* technique; see the references at
 the bottom.
 
-### Content-keyed cache
+### Content-keyed, per-folder cache
 
 Hashes are cached per video, keyed by a **content fingerprint** (file size + first
 and last 1 MiB), not by path. Renaming or reorganising your library does **not**
 trigger recomputation, and two files with the same fingerprint are byte-identical
 — so exact duplicates are caught for free before any perceptual work.
+
+The cache **lives with your videos**, so it is portable — move a folder and its
+hashes travel with it. Each folder that contains videos gets a hidden `.vidsim/`
+holding one record per video in it; the **collection root** (the folder you point
+`cache-build` at) additionally holds the global search index:
+
+```
+A/                            ← the collection: the folder you run cache-build on
+  .vidsim/
+    index.faiss               ← index over ALL frames under A (enables cross-folder matching)
+    rowmap.npz                ← maps index rows back to (video, frame, timestamp)
+    collection.json           ← schema/params fingerprint + which folder holds each record
+  B/
+    .vidsim/<file_id>.json    ← hash records for the videos in B
+    D.mp4  E.mp4
+  C/
+    .vidsim/<file_id>.json
+```
+
+A **collection** is simply the tree under the folder you run `cache-build` on —
+everything in it is compared against everything else (that's what the single,
+root-level index is for; it's what lets a clip in `B` be matched to its source in
+`C`). A byte-identical copy that appears in several folders is stored once, in the
+first folder seen, with all its paths recorded.
 
 ---
 
@@ -135,23 +159,30 @@ This creates the environment and builds `vpdq` and `faiss-cpu`.
 
 ## Usage
 
+`cache-build` is the **only** command that reads video files or writes the cache.
+`find` and `pairs` are pure reads against the index it builds — so **run
+`cache-build` first**, and re-run it whenever the collection changes.
+
 ### 1. Build the cache + index over your collection
 
-Walks `ROOT` recursively, hashes every video, and builds the search index.
-Incremental: re-running only hashes new or changed files and drops records for
-files that disappeared.
+Walks the collection recursively, hashes every video, and builds the search
+index. Incremental: re-running only hashes new or changed files, drops records for
+files that disappeared, and otherwise reuses what's cached.
 
 ```sh
 uv run vidsim cache-build /path/to/your/videos
 ```
 
+(Pointing it at a subfolder of an existing collection attaches to that collection
+rather than starting a new one.)
+
 ### 2. Check one video against the collection
 
 Run this on anything you're about to save, to see whether — and how much of it —
-you already have.
+you already have. The query video is the argument; `--in` names the collection.
 
 ```sh
-uv run vidsim find /path/to/new_video.mp4
+uv run vidsim find /path/to/new_video.mp4 --in /path/to/your/videos
 ```
 
 Example output:
@@ -168,7 +199,7 @@ Example output:
 ### 3. Scan the whole collection for related pairs
 
 ```sh
-uv run vidsim pairs
+uv run vidsim pairs /path/to/your/videos
 ```
 
 Reports every pair where one video draws meaningfully from another, strongest
@@ -179,7 +210,7 @@ first. Duplicates show ~100% in both directions; subsets show high one way only.
 If you change the index type without re-hashing:
 
 ```sh
-uv run vidsim index --index-kind hnsw
+uv run vidsim index /path/to/your/videos --index-kind hnsw
 ```
 
 ### Machine-readable output
@@ -205,8 +236,9 @@ Internal knobs not exposed as flags (edit `config.py`):
 `offset_tolerance_s` (offset bin width, absorbs re-encode jitter) and
 `min_segment_frames` (~3 s minimum shared segment).
 
-The cache lives at `~/.cache/vidsim` by default; override with the
-`VIDSIM_CACHE_DIR` environment variable.
+The cache lives in hidden `.vidsim/` folders alongside your videos (see
+[Content-keyed, per-folder cache](#content-keyed-per-folder-cache)), so it travels
+with them when you move folders. To discard it, delete the `.vidsim/` directories.
 
 ---
 

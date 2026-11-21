@@ -8,7 +8,6 @@ the cache.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -78,28 +77,44 @@ class MatchParams:
 
 
 # --- Paths ---------------------------------------------------------------
+#
+# The cache lives WITH the videos. Each folder that directly contains videos
+# gets a hidden `.vidsim/` holding one `<file_id>.json` record per video in it.
+# The collection root (the folder you run `cache-build` on) additionally holds
+# the global index, its row-map, and the manifest in its own `.vidsim/`:
+#
+#   A/.vidsim/{index.faiss, rowmap.npz, collection.json}
+#   A/B/.vidsim/<file_id>.json   (records for videos directly in B)
+#
+# Record filenames are `<file_id>.json`; the collection-level files have fixed
+# names, so they never collide even when a video sits directly in the root.
+
+VIDSIM_DIRNAME = ".vidsim"
 
 
-def cache_dir() -> Path:
-    """Root cache directory. Override with VIDSIM_CACHE_DIR."""
-    env = os.environ.get("VIDSIM_CACHE_DIR")
-    base = Path(env) if env else Path.home() / ".cache" / "vidsim"
-    return base
+def vidsim_dir(folder: str | Path) -> Path:
+    """The `.vidsim/` directory inside *folder*."""
+    return Path(folder) / VIDSIM_DIRNAME
 
 
-def features_dir() -> Path:
-    """Per-video hash records live here (one file per video)."""
-    return cache_dir() / "features"
+def record_path(folder: str | Path, fid: str) -> Path:
+    """Path to the hash record for *fid* stored in *folder*'s `.vidsim/`."""
+    return vidsim_dir(folder) / f"{fid}.json"
 
 
-def index_path() -> Path:
-    """Serialised FAISS binary index."""
-    return cache_dir() / "index.faiss"
+def index_path(root: str | Path) -> Path:
+    """Serialised FAISS binary index for the collection rooted at *root*."""
+    return vidsim_dir(root) / "index.faiss"
 
 
-def rowmap_path() -> Path:
-    """Row-map sidecar: maps each index row -> (file_id, frame_number, timestamp)."""
-    return cache_dir() / "rowmap.npz"
+def rowmap_path(root: str | Path) -> Path:
+    """Row-map sidecar: index row -> (file_id, frame_number, timestamp)."""
+    return vidsim_dir(root) / "rowmap.npz"
+
+
+def manifest_path(root: str | Path) -> Path:
+    """Collection manifest: schema/params fingerprint + file_id -> folder map."""
+    return vidsim_dir(root) / "collection.json"
 
 
 DEFAULT_HASH_PARAMS = HashParams()

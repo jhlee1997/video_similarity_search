@@ -20,6 +20,8 @@ from dataclasses import dataclass
 import faiss
 import numpy as np
 
+from pathlib import Path
+
 from .config import HASH_BITS, index_path, rowmap_path
 from .cache import VideoRecord
 from .hashing import features_to_matrix
@@ -79,22 +81,22 @@ class FrameIndex:
 
     # ---- persistence ----
 
-    def save(self) -> None:
-        index_path().parent.mkdir(parents=True, exist_ok=True)
-        faiss.write_index_binary(self.index, str(index_path()))
+    def save(self, root: str | Path) -> None:
+        index_path(root).parent.mkdir(parents=True, exist_ok=True)
+        faiss.write_index_binary(self.index, str(index_path(root)))
         np.savez(
-            rowmap_path(),
+            rowmap_path(root),
             file_ids=self.file_ids,
             frame_numbers=self.frame_numbers,
             timestamps=self.timestamps,
         )
 
     @classmethod
-    def load(cls) -> "FrameIndex | None":
-        if not index_path().exists() or not rowmap_path().exists():
+    def load(cls, root: str | Path) -> "FrameIndex | None":
+        if not index_path(root).exists() or not rowmap_path(root).exists():
             return None
-        index = faiss.read_index_binary(str(index_path()))
-        data = np.load(rowmap_path(), allow_pickle=True)
+        index = faiss.read_index_binary(str(index_path(root)))
+        data = np.load(rowmap_path(root), allow_pickle=True)
         return cls(
             index=index,
             file_ids=data["file_ids"],

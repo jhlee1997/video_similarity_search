@@ -1,12 +1,13 @@
 """vidsim command-line interface.
 
-Commands:
-  cache-build <root>   hash every video under <root> into the cache (incremental)
-  index                 (re)build the FAISS frame index from the cache
-  find <video>          report what the cache already contains like <video>
-  pairs                 scan the whole collection for dup/containment pairs
+Commands (COLLECTION is the folder you ran cache-build on):
+  cache-build COLLECTION        hash every video under it into the cache
+  index COLLECTION              (re)build the FAISS frame index from the cache
+  find VIDEO --in COLLECTION    report how much of VIDEO the collection contains
+  pairs COLLECTION              scan the whole collection for dup/subset pairs
 
 None of these commands ever delete or move a video. Output is a report.
+The cache lives WITH the videos (per-folder .vidsim/); only cache-build writes.
 """
 
 from __future__ import annotations
@@ -19,9 +20,9 @@ import click
 from .aggregate import compare
 from .cache import (
     build_record,
-    load_all_records,
-    load_record,
-    save_record,
+    find_collection_root,
+    load_records,
+    resolve_collection_root,
     sync,
 )
 from .config import (
@@ -51,7 +52,7 @@ def cli() -> None:
 
 
 @cli.command("cache-build")
-@click.argument("root", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument("collection", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--seconds-per-hash", default=DEFAULT_HASH_PARAMS.seconds_per_hash,
               show_default=True, help="vpdq sampling interval in seconds (~fps).")
 @click.option("--quality-floor", default=DEFAULT_HASH_PARAMS.quality_floor,
@@ -60,36 +61,64 @@ def cli() -> None:
               help="Rebuild the FAISS index after syncing.")
 @click.option("--index-kind", default="flat", type=click.Choice(["flat", "hnsw"]),
               show_default=True)
-def cache_build(root: Path, seconds_per_hash: float, quality_floor: int,
+def cache_build(collection: Path, seconds_per_hash: float, quality_floor: int,
                 reindex: bool, index_kind: str) -> None:
-    """Hash every video under ROOT into the cache (incremental)."""
+    """Hash every video under COLLECTION into the per-folder cache (incremental)."""
+    root = resolve_collection_root(collection)
+    if root != collection.resolve():
+        click.echo(f"(attaching to existing collection at {root})")
     params = _hash_params(seconds_per_hash, quality_floor)
     stats = sync(root, params)
     click.echo(
         f"added={stats.added} updated={stats.updated} unchanged={stats.unchanged} "
-        f"removed={stats.removed} failed={stats.failed}"
+        f"removed={stats.removed} duplicate-copies={stats.duplicate_copies} "
+        f"failed={stats.failed}"
     )
     if reindex:
-        _do_index(index_kind)
+        _do_index(root, index_kind)
 
 
-def _do_index(kind: str) -> None:
-    records = load_all_records()
+def _do_index(root: Path, kind: str) -> None:
+    records = load_records(root)
     idx = FrameIndex.build(records, kind=kind)
-    idx.save()
+    idx.save(root)
     click.echo(f"index: {len(idx)} frames from {len(records)} videos ({kind})")
 
 
+def _resolve_for_read(collection: Path) -> Path:
+    """Locate the collection root for a read command, or exit with guidance.
+
+    Accepts a subfolder of a collection and walks up to the folder that actually
+    holds the index, so reads behave consistently with cache-build.
+    """
+    root = find_collection_root(collection)
+    if root is None:
+        click.echo(
+            f"No vidsim index found at or above {collection}. "
+            f"Run `vidsim cache-build` on the collection first.",
+            err=True,
+        )
+        sys.exit(1)
+    return root
+
+
 @cli.command("index")
+@click.argument("collection", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--index-kind", default="flat", type=click.Choice(["flat", "hnsw"]),
               show_default=True)
-def index_cmd(index_kind: str) -> None:
-    """(Re)build the FAISS frame index from the current cache."""
-    _do_index(index_kind)
+def index_cmd(collection: Path, index_kind: str) -> None:
+    """(Re)build the FAISS frame index for COLLECTION from its cache."""
+    # Attach to an existing collection root if COLLECTION is a subfolder, so we
+    # never fragment one collection into two divergent indexes.
+    root = resolve_collection_root(collection)
+    _do_index(root, index_kind)
 
 
 @cli.command("find")
 @click.argument("video", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--in", "collection", required=True,
+              type=click.Path(exists=True, file_okay=False, path_type=Path),
+              help="Collection root to search (the folder you ran cache-build on).")
 @click.option("--seconds-per-hash", default=DEFAULT_HASH_PARAMS.seconds_per_hash)
 @click.option("--quality-floor", default=DEFAULT_HASH_PARAMS.quality_floor)
 @click.option("--frame-radius", type=int, default=None,
@@ -97,16 +126,17 @@ def index_cmd(index_kind: str) -> None:
 @click.option("--min-coverage", type=float, default=None,
               help="Only report targets reaching this directional coverage.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text.")
-def find_cmd(video: Path, seconds_per_hash: float, quality_floor: int,
-             frame_radius: int | None, min_coverage: float | None,
-             as_json: bool) -> None:
+def find_cmd(video: Path, collection: Path, seconds_per_hash: float,
+             quality_floor: int, frame_radius: int | None,
+             min_coverage: float | None, as_json: bool) -> None:
     """Report how much of VIDEO is drawn from anything in the collection."""
-    idx = FrameIndex.load()
+    root = _resolve_for_read(collection)
+    idx = FrameIndex.load(root)
     if idx is None:
-        click.echo("No index found. Run `vidsim cache-build <root>` first.", err=True)
+        click.echo(f"No index at {root}. Run `vidsim cache-build` first.", err=True)
         sys.exit(1)
 
-    records = load_all_records()
+    records = load_records(root)
     params = _hash_params(seconds_per_hash, quality_floor)
     mp = _match_params(frame_hamming_radius=frame_radius, report_coverage=min_coverage)
 
@@ -117,8 +147,9 @@ def find_cmd(video: Path, seconds_per_hash: float, quality_floor: int,
         existing = records[fid].paths
         click.echo(f"EXACT duplicate of cached content: {existing}")
 
-    # Reuse cached hashes if present, else hash on the fly (don't persist here).
-    rec = load_record(fid)
+    # Reuse the cached record if the collection already has this content;
+    # otherwise hash the query on the fly (don't persist -- find is a read).
+    rec = records.get(fid)
     if rec is None or rec.is_stale(params):
         rec = build_record(video, fid, params)
 
@@ -136,29 +167,29 @@ def find_cmd(video: Path, seconds_per_hash: float, quality_floor: int,
 
 
 @cli.command("pairs")
-@click.option("--seconds-per-hash", default=DEFAULT_HASH_PARAMS.seconds_per_hash)
-@click.option("--quality-floor", default=DEFAULT_HASH_PARAMS.quality_floor)
+@click.argument("collection", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--frame-radius", type=int, default=None)
 @click.option("--min-shared-frames", type=int, default=None,
               help="Min candidate frame matches before scoring a pair.")
 @click.option("--min-coverage", type=float, default=None,
               help="Only report a pair if a direction reaches this coverage.")
 @click.option("--json", "as_json", is_flag=True)
-def pairs_cmd(seconds_per_hash: float, quality_floor: int, frame_radius: int | None,
+def pairs_cmd(collection: Path, frame_radius: int | None,
               min_shared_frames: int | None, min_coverage: float | None,
               as_json: bool) -> None:
-    """Scan the whole collection; report how much each video draws from another.
+    """Scan COLLECTION; report how much each video draws from another.
 
     Directional: a pair may appear twice (B drawn from A, and A drawn from B)
     when both directions reach the coverage threshold -- e.g. duplicates show
     ~100% both ways, a subset shows high one way and low the other.
     """
-    idx = FrameIndex.load()
+    root = _resolve_for_read(collection)
+    idx = FrameIndex.load(root)
     if idx is None:
-        click.echo("No index found. Run `vidsim cache-build <root>` first.", err=True)
+        click.echo(f"No index at {root}. Run `vidsim cache-build` first.", err=True)
         sys.exit(1)
 
-    records = load_all_records()
+    records = load_records(root)
     mp = _match_params(
         frame_hamming_radius=frame_radius,
         min_shared_frames=min_shared_frames,

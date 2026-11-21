@@ -16,7 +16,15 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from .config import SCHEMA_VERSION, VIDEO_EXTS, HashParams, features_dir
+from .config import (
+    SCHEMA_VERSION,
+    VIDEO_EXTS,
+    VIDSIM_DIRNAME,
+    HashParams,
+    manifest_path,
+    record_path,
+    vidsim_dir,
+)
 from .fileid import file_id
 from .hashing import FrameFeature, hash_video
 
@@ -71,12 +79,9 @@ class VideoRecord:
         )
 
 
-def _record_path(fid: str) -> Path:
-    return features_dir() / f"{fid}.json"
-
-
-def load_record(fid: str) -> VideoRecord | None:
-    p = _record_path(fid)
+def load_record(folder: str | Path, fid: str) -> VideoRecord | None:
+    """Load the record for *fid* from *folder*'s `.vidsim/`, if present."""
+    p = record_path(folder, fid)
     if not p.exists():
         return None
     try:
@@ -86,37 +91,95 @@ def load_record(fid: str) -> VideoRecord | None:
         return None
 
 
-def save_record(rec: VideoRecord) -> None:
-    features_dir().mkdir(parents=True, exist_ok=True)
-    p = _record_path(rec.file_id)
+def save_record(rec: VideoRecord, folder: str | Path) -> None:
+    """Write *rec* into *folder*'s `.vidsim/` (atomic)."""
+    vidsim_dir(folder).mkdir(parents=True, exist_ok=True)
+    p = record_path(folder, rec.file_id)
     tmp = p.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(rec.to_dict(), f)
     tmp.replace(p)  # atomic on POSIX
 
 
-def load_all_records() -> dict[str, VideoRecord]:
-    """Load every cached record, keyed by file_id."""
-    out: dict[str, VideoRecord] = {}
-    d = features_dir()
-    if not d.exists():
-        return out
-    for p in d.glob("*.json"):
-        try:
-            with p.open("r", encoding="utf-8") as f:
-                rec = VideoRecord.from_dict(json.load(f))
-            out[rec.file_id] = rec
-        except (json.JSONDecodeError, KeyError, OSError):
+def _scan_record_files(root: Path) -> dict[str, list[Path]]:
+    """Map file_id -> all `.vidsim/<fid>.json` paths found under *root*.
+
+    A given content may (through partial earlier runs or migration) have a
+    record file in more than one folder; we collect them all so the caller can
+    keep one and delete the rest. Only `<fid>.json` files are considered: the
+    `*.json` glob already excludes `index.faiss`/`rowmap.npz`, and we skip
+    `collection.json` explicitly.
+    """
+    found: dict[str, list[Path]] = {}
+    for vd in root.rglob(VIDSIM_DIRNAME):
+        if not vd.is_dir():
             continue
+        for p in vd.glob("*.json"):
+            if p.name == "collection.json":
+                continue
+            fid = p.stem
+            found.setdefault(fid, []).append(p)
+    return found
+
+
+def load_all_records(root: str | Path) -> dict[str, tuple[VideoRecord, Path]]:
+    """Load every record under *root*, keyed by file_id -> (record, folder).
+
+    `folder` is the directory whose `.vidsim/` held the record. If the same
+    file_id has record files in several folders, one is chosen deterministically
+    (shallowest path, then lexical) and the duplicates are left for `sync` to
+    clean up. Unreadable records are skipped.
+    """
+    out: dict[str, tuple[VideoRecord, Path]] = {}
+    root = Path(root)
+    for fid, paths in _scan_record_files(root).items():
+        for p in sorted(paths, key=lambda q: (len(q.parts), str(q))):
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    rec = VideoRecord.from_dict(json.load(f))
+            except (json.JSONDecodeError, KeyError, OSError):
+                continue
+            out[rec.file_id] = (rec, p.parent.parent)  # folder = parent of .vidsim/
+            break
     return out
 
 
+def load_records(root: str | Path) -> dict[str, VideoRecord]:
+    """Convenience: records under *root* keyed by file_id (folder stripped)."""
+    return {fid: rec for fid, (rec, _folder) in load_all_records(root).items()}
+
+
 def iter_video_files(root: str | Path):
-    """Yield video file paths under *root*, recursively."""
+    """Yield video file paths under *root*, recursively, skipping `.vidsim/`."""
     root = Path(root)
     for p in root.rglob("*"):
+        if VIDSIM_DIRNAME in p.parts:
+            continue  # never descend into cache dirs
         if p.is_file() and p.suffix.lower().lstrip(".") in VIDEO_EXTS:
             yield p
+
+
+def find_collection_root(start: str | Path) -> Path | None:
+    """Nearest ancestor of *start* (incl. itself) holding a collection index.
+
+    Returns None if none is found. Used by read commands (find/pairs/index) so
+    pointing them at a subfolder still locates the real collection.
+    """
+    start = Path(start).resolve()
+    for folder in (start, *start.parents):
+        if (vidsim_dir(folder) / "index.faiss").exists():
+            return folder
+    return None
+
+
+def resolve_collection_root(start: str | Path) -> Path:
+    """Resolve the collection root for a `cache-build` on *start*.
+
+    If an ancestor (including *start*) already holds a collection index, use that
+    ancestor so a sub-run attaches to the existing collection instead of
+    fragmenting it. Otherwise *start* itself is the root.
+    """
+    return find_collection_root(start) or Path(start).resolve()
 
 
 def build_record(path: Path, fid: str, params: HashParams) -> VideoRecord:
@@ -142,19 +205,72 @@ class SyncStats:
     unchanged: int = 0
     removed: int = 0
     failed: int = 0
+    duplicate_copies: int = 0  # byte-identical files sharing one record
+
+
+def _write_manifest(root: Path, params: HashParams,
+                    location: dict[str, Path]) -> None:
+    """Write collection.json: provenance + file_id -> folder-holding-its-record."""
+    rootr = root.resolve()
+    folder_map: dict[str, str] = {}
+    for fid, folder in location.items():
+        try:
+            rel = str(folder.resolve().relative_to(rootr))
+        except ValueError:
+            rel = str(folder.resolve())
+        folder_map[fid] = rel or "."
+    data = {
+        "schema_version": SCHEMA_VERSION,
+        "vpdq_version": VPDQ_VERSION,
+        "params_fingerprint": params.fingerprint(),
+        "records": folder_map,
+    }
+    vidsim_dir(root).mkdir(parents=True, exist_ok=True)
+    p = manifest_path(root)
+    tmp = p.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    tmp.replace(p)
+
+
+def _prune_empty_vidsim(root: Path) -> None:
+    """Remove `.vidsim/` dirs holding nothing but leftover `.tmp` garbage.
+
+    A crashed save can leave `<fid>.json.tmp`; we delete those first so the dir
+    can be recognised as empty and removed. The collection root's own `.vidsim/`
+    (which holds the index) is never removed.
+    """
+    rootr = root.resolve()
+    for vd in root.rglob(VIDSIM_DIRNAME):
+        if not vd.is_dir():
+            continue
+        for tmp in vd.glob("*.tmp"):
+            tmp.unlink(missing_ok=True)
+        if vd.parent.resolve() == rootr:
+            continue
+        if not any(vd.iterdir()):
+            vd.rmdir()
 
 
 def sync(root: str | Path, params: HashParams) -> SyncStats:
-    """Reconcile the cache with the videos currently under *root*.
+    """Reconcile the per-folder cache with the videos currently under *root*.
 
-    - new content -> hash and add
-    - stale record (schema/vpdq/params changed) -> recompute
-    - unchanged -> leave, just refresh known path
-    - records whose content is no longer present anywhere under root -> drop
+    - new content          -> hash, write record in the video's own folder
+    - stale record         -> recompute, written to the video's current folder
+    - unchanged            -> keep hashes; record follows the video if it moved
+    - byte-identical copy  -> share one record (first folder seen); add its path
+    - content gone          -> drop its record
+    Duplicate record files for the same content are collapsed to one. Writes
+    collection.json and prunes emptied `.vidsim/` dirs. Does NOT build the index
+    (the caller does that) so this stays pure cache reconciliation.
     """
+    root = Path(root)
     stats = SyncStats()
-    existing = load_all_records()
+    existing = load_all_records(root)             # fid -> (rec, old home folder)
+    all_record_files = _scan_record_files(root)   # fid -> every record file path
     seen_ids: set[str] = set()
+    home_rec: dict[str, VideoRecord] = {}          # fid -> the live record (in memory)
+    location: dict[str, Path] = {}                 # fid -> folder its record lives in
 
     files = list(iter_video_files(root))
     for path in tqdm(files, desc="scanning", unit="vid"):
@@ -163,29 +279,58 @@ def sync(root: str | Path, params: HashParams) -> SyncStats:
         except OSError:
             stats.failed += 1
             continue
-        seen_ids.add(fid)
-        rec = existing.get(fid)
+        folder = path.parent
+        rp = str(path.resolve())
         try:
-            if rec is None:
-                save_record(build_record(path, fid, params))
-                stats.added += 1
-            elif rec.is_stale(params):
-                save_record(build_record(path, fid, params))
-                stats.updated += 1
-            else:
-                # Keep hashes; refresh path if it moved.
-                rp = str(path.resolve())
+            if fid in seen_ids:
+                # Byte-identical copy already handled this run: add its path to
+                # the one shared record (kept in memory, so no fragile re-read).
+                rec = home_rec[fid]
                 if rp not in rec.paths:
-                    rec.paths = [rp] + [p for p in rec.paths if p != rp]
-                    save_record(rec)
-                stats.unchanged += 1
-        except Exception:  # noqa: BLE001 - hashing a bad file shouldn't abort the run
+                    rec.paths.append(rp)
+                    save_record(rec, location[fid])
+                stats.duplicate_copies += 1
+                continue
+
+            seen_ids.add(fid)
+            prior = existing.get(fid)
+            if prior is None:
+                rec = build_record(path, fid, params)
+                save_record(rec, folder)
+                stats.added += 1
+            else:
+                old_rec, old_home = prior
+                if old_rec.is_stale(params):
+                    rec = build_record(path, fid, params)  # paths reset to [rp]
+                    stats.updated += 1
+                else:
+                    rec = old_rec
+                    rec.paths = [rp]  # drop stale paths; copies re-append above
+                    stats.unchanged += 1
+                # The record follows the video to its current folder. If the
+                # video moved, write to the new folder and drop the old file.
+                save_record(rec, folder)
+                if old_home.resolve() != folder.resolve():
+                    record_path(old_home, fid).unlink(missing_ok=True)
+            home_rec[fid] = rec
+            location[fid] = folder
+        except Exception:  # noqa: BLE001 - a bad file shouldn't abort the run
             stats.failed += 1
 
-    # Drop records whose content was not seen anywhere under root.
-    for fid in existing:
+    # Remove record files for content no longer present, and collapse any
+    # duplicate record files for seen content down to the chosen home folder.
+    for fid, paths in all_record_files.items():
+        home = location.get(fid)
         if fid not in seen_ids:
-            _record_path(fid).unlink(missing_ok=True)
+            for p in paths:
+                p.unlink(missing_ok=True)
             stats.removed += 1
+        elif home is not None:
+            keep = record_path(home, fid).resolve()
+            for p in paths:
+                if p.resolve() != keep:
+                    p.unlink(missing_ok=True)
 
+    _write_manifest(root, params, location)
+    _prune_empty_vidsim(root)
     return stats
