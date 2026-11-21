@@ -558,6 +558,12 @@ def sync(root: str | Path, params: HashParams,
     to_hash = [(p.hash_path, fid) for fid, p in plans.items() if p.kind != "cached"]
     done_fids: set[str] = set()
 
+    # Collection-level status (distinct from the per-run hashing bar below): how
+    # much of the whole library is already cached. `plans` holds every video seen
+    # this run; to_hash is the subset still needing work.
+    if plans:
+        ui.collection_status(cached=len(plans) - len(to_hash), total=len(plans))
+
     if to_hash:
         # --- Progress weight per file (DURATION), computed parent-side, no worker
         # involvement. Cached files use their stored duration (free). New files

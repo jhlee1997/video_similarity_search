@@ -65,6 +65,26 @@ def note(msg: str) -> None:
     _err(f"      {msg}")
 
 
+def collection_status(cached: int, total: int) -> None:
+    """One-shot collection-level 'how much of the library is cached' bar + text,
+    distinct from the per-run hashing bar (which only covers this run's work).
+    A static (non-updating) bar drawn once to stderr; pure display, no state."""
+    try:
+        total = max(0, int(total))
+        cached = max(0, min(int(cached), total))
+        if total == 0:
+            return
+        pct = cached / total
+        width = 24
+        filled = int(round(pct * width))
+        bar = "█" * filled + "░" * (width - filled)
+        to_do = total - cached
+        _err(f"      library: |{bar}| {pct*100:3.0f}%  "
+             f"{cached}/{total} cached, {to_do} to hash this run")
+    except Exception:  # noqa: BLE001 - display must never break the build
+        pass
+
+
 def is_tty() -> bool:
     return sys.stderr.isatty()
 
