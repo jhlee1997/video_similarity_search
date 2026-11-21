@@ -215,5 +215,20 @@ def pairs_cmd(collection: Path, frame_radius: int | None,
         click.echo("")
 
 
+@cli.command("duration")
+@click.argument("collection", type=click.Path(exists=True, file_okay=False, path_type=Path))
+def duration_cmd(collection: Path) -> None:
+    """Sum the total video duration under COLLECTION (container metadata only).
+
+    Useful for estimating cache-build runtime, which scales with total duration.
+    """
+    from .vid_length import total_duration
+
+    total, count, failed = total_duration(collection)
+    h = int(total // 3600); m = int((total % 3600) // 60); s = int(total % 60)
+    click.echo(f"{count} videos, {failed} unreadable")
+    click.echo(f"total: {total:.0f}s = {h}h {m}m {s}s")
+
+
 def main() -> None:
     cli()

@@ -134,7 +134,8 @@ the videos share content, but *where* is not reliable.
 ## Requirements
 
 - **Python ≥ 3.12** and [`uv`](https://docs.astral.sh/uv/).
-- **FFmpeg** — required at runtime for frame decoding.
+- **FFmpeg** — required at runtime for frame decoding (`vpdq`) and reading
+  container metadata (`av` / PyAV).
 - **pkg-config + FFmpeg dev libraries** — required at *install* time, because
   `vpdq` compiles from source.
 
@@ -154,6 +155,13 @@ uv sync
 ```
 
 This creates the environment and builds `vpdq` and `faiss-cpu`.
+
+> **PyAV note (macOS):** PyAV's prebuilt wheel bundles its own FFmpeg, which on
+> macOS collides with Homebrew's FFmpeg (loaded via `vpdq`) and prints harmless
+> `objc[...] Class AVF… implemented in both` warnings. To silence them, build
+> PyAV against the system FFmpeg so only one copy loads:
+> `uv pip install --no-binary av --force-reinstall av`. The warnings are cosmetic
+> for this tool (it only reads metadata, never captures from a camera).
 
 ---
 
@@ -213,6 +221,29 @@ If you change the index type without re-hashing:
 uv run vidsim index /path/to/your/videos --index-kind hnsw
 ```
 
+### Estimating cache-build runtime
+
+`cache-build`'s cost is dominated by frame hashing, and the work per video scales
+with its **duration** — at the default 1 frame/second, a video contributes roughly
+one hash per second of runtime, regardless of resolution or file size (FFmpeg
+seeks to ~1 fps rather than decoding every frame). So **total duration is a good
+predictor of build time**. Sum it quickly (metadata only, no decoding):
+
+```sh
+uv run vidsim duration /path/to/your/videos
+```
+
+```
+1000 videos, 2 unreadable
+total: 182400s = 50h 40m 0s
+```
+
+To turn that into a time estimate, measure your machine's throughput once — run
+`cache-build` on a small sample and divide its wall-clock time by that sample's
+total duration to get a *seconds-of-build per second-of-video* factor, then
+multiply by the figure above. The factor shrinks proportionally if you raise
+`--seconds-per-hash` (fewer frames hashed) and grows if you lower it.
+
 ### Machine-readable output
 
 Both `find` and `pairs` accept `--json` for scripting a review/dedup workflow.
@@ -266,7 +297,8 @@ src/vidsim/
   index.py       FAISS binary index + row-map (row → file_id/frame/timestamp)
   aggregate.py   THE CORE: temporal Hough voting → shared segments
   report.py      directional % + segment list (text / JSON)
-  cli.py         cache-build · index · find · pairs
+  vid_length.py  parallel PyAV duration sum (runtime estimation)
+  cli.py         cache-build · index · find · pairs · duration
 ```
 
 ---
