@@ -213,10 +213,14 @@ def find_cmd(video: Path, collection: Path, seconds_per_hash: float,
                    "overwrite the cache.")
 @click.option("--no-cache", is_flag=True,
               help="Compute fresh without reading or writing the pairs cache.")
+@click.option("--show-ignored", is_flag=True,
+              help="Also show pairs you've marked ignored (lets you un-ignore "
+                   "them at the prompt).")
 @click.option("--json", "as_json", is_flag=True)
 def pairs_cmd(collection: Path, frame_radius: int | None,
               min_shared_frames: int | None, min_coverage: float | None,
-              refresh: bool, no_cache: bool, as_json: bool) -> None:
+              refresh: bool, no_cache: bool, show_ignored: bool,
+              as_json: bool) -> None:
     """Scan COLLECTION; report how much each video draws from another.
 
     Directional: a pair may appear twice (B drawn from A, and A drawn from B)
@@ -230,7 +234,7 @@ def pairs_cmd(collection: Path, frame_radius: int | None,
     the matching code, delete .vidsim/pairs.json (or use --refresh) so stale
     pairs aren't reused.
     """
-    from . import pairs_cache
+    from . import pairs_cache, pairs_ignore
 
     root = _resolve_for_read(collection)
     idx = FrameIndex.load(root)
@@ -275,22 +279,124 @@ def pairs_cmd(collection: Path, frame_radius: int | None,
     collected = [r for r in all_pairs if r.coverage >= mp.report_coverage]
     collected.sort(key=lambda r: r.coverage, reverse=True)
 
-    if not as_json:
-        ui.summary([("videos scanned", len(records)),
-                    ("related pairs", len(collected)),
-                    ("pairs cache", cache_status),
-                    ("elapsed", ui.elapsed(dt))])
-        click.echo(err=True)  # clean blank line before the report on stdout
-
     if as_json:
+        # Machine output: complete + predictable. The ignore list is a human
+        # viewing convenience only, so it is NOT applied here (and no prompt).
         click.echo(dump_json(collected, records))
         return
-    if not collected:
-        click.echo("No shared-content pairs found.")
+
+    # Ignore list (human report only): pairs the user reviewed and hid. Prune
+    # entries whose video is gone, and write that back now so stale entries don't
+    # accumulate even if the user never interacts at the prompt.
+    loaded_ignored = pairs_ignore.load(root)
+    ignored = pairs_ignore.prune(loaded_ignored, current)
+    if ignored != loaded_ignored:
+        try:
+            pairs_ignore.save(root, ignored)
+        except Exception:  # noqa: BLE001 - housekeeping must never break the report
+            pass
+
+    # Partition by ignore state. By default ignored pairs are hidden; with
+    # --show-ignored they're shown too (so they can be un-ignored at the prompt).
+    n_ignored = sum(1 for r in collected
+                    if pairs_ignore.is_ignored(ignored, r.query_id, r.target_id))
+    shown = collected if show_ignored else [
+        r for r in collected
+        if not pairs_ignore.is_ignored(ignored, r.query_id, r.target_id)]
+    n_hidden = 0 if show_ignored else n_ignored
+
+    ui.summary([("videos scanned", len(records)),
+                ("related pairs", len(collected)),
+                ("hidden (ignored)", n_hidden),
+                ("pairs cache", cache_status),
+                ("elapsed", ui.elapsed(dt))])
+    click.echo(err=True)  # clean blank line before the report on stdout
+
+    if not shown:
+        click.echo("No shared-content pairs found."
+                   if not collected else "All matching pairs are ignored "
+                   "(use --show-ignored to see them).")
         return
-    for r in collected:
+
+    # Label each shown pair so the user can refer to it at the prompt.
+    labels = _pair_labels(len(shown))
+    for label, r in zip(labels, shown):
+        ign = pairs_ignore.is_ignored(ignored, r.query_id, r.target_id)
+        tag = "  [ignored]" if (show_ignored and ign) else ""
+        click.echo(f"[{label}]{tag}")
         click.echo(format_result_line(r, records))
         click.echo("")
+
+    # Interactive prompt: only on a real terminal (never when piped), so scripts
+    # can't hang. Lets the user ignore (or, under --show-ignored, un-ignore).
+    _prompt_ignore(root, shown, labels, ignored, show_ignored)
+
+
+def _pair_labels(n: int) -> list[str]:
+    """A, B, ..., Z, AA, AB, ... enough distinct labels for n pairs."""
+    import string
+    letters = string.ascii_uppercase
+    out, i = [], 0
+    while len(out) < n:
+        q, r = divmod(i, len(letters))
+        out.append((letters[q - 1] if q else "") + letters[r])
+        i += 1
+    return out
+
+
+def _prompt_ignore(root, shown, labels, ignored, show_ignored) -> None:
+    """Ask which labelled pairs to ignore (or un-ignore). Interactive-only; writes
+    the ignore list if it changed. Any error here must never break the report."""
+    from . import pairs_ignore
+
+    # Only prompt when BOTH input and output are a real terminal. Requiring
+    # stdout to be a TTY too means `vidsim pairs > out.txt` (report redirected to
+    # a file) does not fire a prompt for pairs the user can't see on screen.
+    if not (sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()):
+        return
+    verb = "un-ignore" if show_ignored else "ignore"
+    try:
+        ans = click.prompt(
+            f"\n{verb.capitalize()} any of these going forward? "
+            f"Enter labels (e.g. A,C) or press Enter to skip",
+            default="", show_default=False, err=True,
+        ).strip()
+    except (EOFError, click.Abort):
+        return
+    if not ans:
+        return
+
+    by_label = dict(zip(labels, shown))
+    tokens = [t for t in
+              (tok.strip().upper() for tok in ans.replace(",", " ").split()) if t]
+    picked = [by_label[t] for t in tokens if t in by_label]
+    unknown = [t for t in tokens if t not in by_label]
+    if unknown:
+        click.echo(f"Ignoring unrecognised label(s): {', '.join(unknown)}", err=True)
+    if not picked:
+        click.echo("No matching labels; nothing changed.", err=True)
+        return
+
+    # Count DISTINCT unordered pairs changed (two directional rows of the same
+    # pair collapse to one canonical key), so the message doesn't overstate.
+    changed: set = set()
+    for r in picked:
+        if show_ignored:
+            if pairs_ignore.is_ignored(ignored, r.query_id, r.target_id):
+                pairs_ignore.remove(ignored, r.query_id, r.target_id)
+                changed.add(tuple(sorted((r.query_id, r.target_id))))
+        else:
+            if not pairs_ignore.is_ignored(ignored, r.query_id, r.target_id):
+                pairs_ignore.add(ignored, r.query_id, r.target_id)
+                changed.add(tuple(sorted((r.query_id, r.target_id))))
+    if not changed:
+        click.echo("Nothing changed (already in that state).", err=True)
+        return
+    try:
+        pairs_ignore.save(root, ignored)
+        click.echo(f"{verb.capitalize()}d {len(changed)} pair(s).", err=True)
+    except Exception:  # noqa: BLE001 - must never break the report
+        click.echo("(could not write the ignore list)", err=True)
 
 
 @cli.command("duration")

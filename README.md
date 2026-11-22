@@ -272,6 +272,16 @@ instant instead of a full re-scan.
   `--frame-radius` or `--min-shared-frames`, or update the matching code, **delete
   `.vidsim/pairs.json`** (or use `--refresh`) so stale pairs aren't reused.
 
+**Ignoring pairs you've reviewed.** When you run `pairs` in a terminal, each
+shown pair is labelled (`[A]`, `[B]`, …) and, after the report, you're asked
+whether to ignore any — enter the labels (e.g. `A,C`) and those pairs are hidden
+from future runs (stored in `.vidsim/pairs_ignore.json`, keyed by content so it
+survives renames). Ignoring hides **both** directions of that video pair. Pass
+`--show-ignored` to list ignored pairs again (and un-ignore them at the same
+prompt). The prompt is skipped automatically for `--json` or any non-terminal
+output (e.g. redirecting to a file). The ignore list affects only the **human
+report** — `--json` always emits the complete set, so scripts get stable data.
+
 > **What the cache stores.** It keeps the directional result for every pair that
 > shares content (above the internal `min-shared-frames` floor); a pair with no
 > shared frames simply has no entry (which reads as 0% — correct). `--min-coverage`
@@ -425,6 +435,7 @@ src/vidsim/
   index.py       FAISS binary index + row-map (row → file_id/frame/timestamp)
   aggregate.py   THE CORE: temporal Hough voting → shared segments
   pairs_cache.py incremental pairs cache (add/remove diff, both-direction add)
+  pairs_ignore.py persistent 'ignore these pairs' list (hidden from reports)
   report.py      directional % + segment list + size/length (text / JSON)
   vid_length.py  parallel PyAV duration reader (runtime estimate + bar weighting)
   ui.py          parent-side progress bars + narration helpers (stderr only)
