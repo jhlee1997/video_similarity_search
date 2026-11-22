@@ -201,6 +201,18 @@ recognised by its path + size + mtime and skipped without re-reading it. Use
 (Pointing it at a subfolder of an existing collection attaches to that collection
 rather than starting a new one.)
 
+> **Oversized files are skipped automatically.** A file that is **4K AND longer
+> than 20 min AND larger than 3 GB** is excluded from hashing — it is never
+> decoded, gets no cache record, and so never appears in the index or in
+> `find` / `pairs`. Such files (typically 4K60 phone/camera footage) cost
+> *many* times more to hash per second of runtime than ordinary video — a
+> single one can occupy a worker for hours — so they are left out to keep a
+> build tractable. **The video file itself is never touched**, and if it was
+> hashed by an earlier run, that stale cache record is dropped on the next
+> `cache-build`. The run summary reports how many were skipped
+> (`skipped (oversized): N`). The thresholds live in `config.py`
+> (`SKIP_MIN_WIDTH/HEIGHT/DURATION_S/SIZE_BYTES`) if you need to change them.
+
 ### 2. Check one video against the collection
 
 Run this on anything you're about to save, to see whether — and how much of it —
@@ -240,11 +252,20 @@ uv run vidsim index /path/to/your/videos --index-kind hnsw
 
 ### Estimating cache-build runtime
 
-`cache-build`'s cost is dominated by frame hashing, and the work per video scales
-with its **duration** — at the default 1 frame/second, a video contributes roughly
-one hash per second of runtime, regardless of resolution or file size (FFmpeg
-seeks to ~1 fps rather than decoding every frame). So **total duration is a good
-predictor of build time**. Sum it quickly (metadata only, no decoding):
+`cache-build`'s cost is dominated by **frame decoding**. At the default 1
+frame/second only ~one hash per second is kept — but `vpdq` still **decodes the
+whole stream** to produce those samples (it does not seek), so the real cost
+scales with *frames decoded*, i.e. **duration × resolution × frame-rate**, not
+duration alone. A 4K60 file therefore costs far more per second of runtime than
+an ordinary 1080p30 one — in testing a single 4K60 file ran at only ~1.7×
+real-time on a 12-core CPU, versus many× faster for normal clips. (This is also
+why such files are [skipped by default](#1-build-the-cache--index-over-your-collection),
+and why neither GPU decode nor downsampling helps much — the cost is in decoding
+every frame to reach the samples.)
+
+So **total duration is only a rough predictor of build time, and underestimates
+badly for high-resolution/high-fps footage.** Sum it quickly (metadata only, no
+decoding):
 
 ```sh
 uv run vidsim duration /path/to/your/videos
@@ -261,11 +282,14 @@ is easy to capture, e.g. `uv run vidsim duration /videos 2>/dev/null`):
 182400
 ```
 
-To turn that into a time estimate, measure your machine's throughput once — run
-`cache-build` on a small sample and divide its wall-clock time by that sample's
-total duration to get a *seconds-of-build per second-of-video* factor, then
-multiply by the figure above. The factor shrinks proportionally if you raise
-`--seconds-per-hash` (fewer frames hashed) and grows if you lower it.
+To turn that into a rough time estimate, measure your machine's throughput once
+— run `cache-build` on a small sample and divide its wall-clock time by that
+sample's total duration to get a *seconds-of-build per second-of-video* factor,
+then multiply by the figure above. Because decode cost depends on
+resolution/fps, use a sample whose resolution mix resembles the whole
+collection, or expect the estimate to run long on 4K-heavy libraries. Raising
+`--seconds-per-hash` keeps *fewer* samples but still decodes the full stream, so
+it gives only a modest speedup — not a proportional one.
 
 ### Progress & output streams
 
@@ -279,7 +303,10 @@ For `cache-build` specifically, while hashing you see, on a terminal:
   "worker 2 is on the big one", not a hang);
 - an **overall hashing bar weighted by video duration** (not file count), so a
   2-hour video claims a proportionally large share instead of counting as "1 of
-  N" — the % reflects actual work, and the `files k/N` counter ticks per file.
+  N", and the `files k/N` counter ticks per file. (The bar advances only as each
+  file *finishes*, and the weight is duration — so a cluster of high-resolution
+  files, which cost more than their duration implies, can make the bar appear to
+  stall while the CPU is in fact fully busy. It is not hung.)
 
 The per-run bar covers only the files hashed *this* run (cached files are
 excluded), so on a re-run it restarts at 0%; the **library line** is the
@@ -319,8 +346,17 @@ Defaults live in `src/vidsim/config.py`; the common ones are also CLI flags.
 | `--workers` | ~¾ of cores | (`cache-build`) Parallel hashing worker processes. Higher saturates the CPU; `1` forces serial. Each worker pins ffmpeg to one thread to avoid oversubscription. |
 
 Internal knobs not exposed as flags (edit `config.py`):
-`offset_tolerance_s` (offset bin width, absorbs re-encode jitter) and
-`min_segment_frames` (~3 s minimum shared segment).
+`offset_tolerance_s` (offset bin width, absorbs re-encode jitter),
+`min_segment_frames` (minimum frames for a shared segment), and
+`max_frame_gap_s` (the floor for how far apart two aligned frames can be and
+still count as one continuous segment; the effective gap scales up with the
+sampling interval, so coarse `--seconds-per-hash` values still work).
+
+**Oversized-file exclusion** (always on, also in `config.py`):
+`SKIP_MIN_WIDTH` / `SKIP_MIN_HEIGHT` / `SKIP_MIN_DURATION_S` /
+`SKIP_MIN_SIZE_BYTES`. A file meeting **all** of these (4K AND > 20 min AND
+> 3 GB) is skipped by `cache-build` — see
+[Build the cache](#1-build-the-cache--index-over-your-collection).
 
 The cache lives in hidden `.vidsim/` folders alongside your videos (see
 [Content-keyed, per-folder cache](#content-keyed-per-folder-cache)), so it travels

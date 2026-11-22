@@ -27,6 +27,28 @@ VIDEO_EXTS = {
 }
 
 
+# --- Oversized-file exclusion (always on) --------------------------------
+#
+# Some videos are prohibitively expensive to hash at ~1 frame/sec: 4K, long,
+# high-fps files decode every frame regardless of sample rate, so a single
+# 4K60 two-hour file can occupy a worker for hours (measured). Such a file is
+# SKIPPED by cache-build -- never hashed, no cache record, absent from the
+# index and therefore from `find`/`pairs`. The video file itself is never
+# touched. A file is skipped only when ALL THREE conditions hold, so an
+# ordinary big-but-short or long-but-low-res video is still hashed normally:
+#
+#   resolution >= 4K   (width >= SKIP_MIN_WIDTH OR height >= SKIP_MIN_HEIGHT)
+#   duration   >  SKIP_MIN_DURATION_S
+#   file size  >  SKIP_MIN_SIZE_BYTES
+#
+# The resolution check needs a metadata probe, so it runs LAST -- only on files
+# that already pass the free size gate and the (usually cached) duration gate.
+SKIP_MIN_WIDTH = 3840
+SKIP_MIN_HEIGHT = 2160
+SKIP_MIN_DURATION_S = 20 * 60      # 20 minutes
+SKIP_MIN_SIZE_BYTES = 3 * 1000**3  # 3 GB (decimal, matches `du`/df reporting)
+
+
 # --- Hashing parameters (part of cache identity) -------------------------
 
 
@@ -69,6 +91,16 @@ class MatchParams:
     # frames to count as a real shared segment -- prunes incidental collisions
     # (black frames, logos, coincidental look-alikes). ~3s at 1 fps.
     min_segment_frames: int = 3
+
+    # FLOOR for the run-splitting gap. Within one offset bin, aligned frames
+    # more than the effective gap apart in B-time belong to DIFFERENT shared
+    # segments (the reuse stopped and later resumed at the same offset). This
+    # absorbs a dropped/low-quality frame or two without bridging genuine gaps,
+    # and stops scattered same-offset frames being fabricated into one segment.
+    # The EFFECTIVE gap used by _vote_segments is max(this, 2.5 x the sampling
+    # interval), so coarse --seconds-per-hash values don't split every run into
+    # single frames (which would destroy all matching). See _vote_segments.
+    max_frame_gap_s: float = 3.0
 
     # Only report a pair whose directional coverage reaches this. A pair is
     # reported if EITHER direction's coverage >= this (so subsets surface even

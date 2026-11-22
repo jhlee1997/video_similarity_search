@@ -27,6 +27,10 @@ from tqdm import tqdm
 from . import ui
 from .config import (
     SCHEMA_VERSION,
+    SKIP_MIN_DURATION_S,
+    SKIP_MIN_HEIGHT,
+    SKIP_MIN_SIZE_BYTES,
+    SKIP_MIN_WIDTH,
     VIDEO_EXTS,
     VIDSIM_DIRNAME,
     HashParams,
@@ -203,6 +207,53 @@ def _stat_pair(path: Path) -> list[float]:
     return [float(st.st_size), float(st.st_mtime)]
 
 
+def _probe_dims_duration(path: Path) -> tuple[int, int, float]:
+    """(width, height, duration_s) from container metadata; (0,0,0.0) on error.
+
+    Metadata-only (no frame decoding). Used by `is_oversized` to check 4K; kept
+    separate so the open happens ONLY for files that already pass the free
+    size/duration gates.
+    """
+    try:
+        import av
+
+        with av.open(str(path)) as c:
+            v = c.streams.video[0]
+            w = int(v.codec_context.width or 0)
+            h = int(v.codec_context.height or 0)
+            if c.duration and c.duration > 0:
+                dur = c.duration / av.time_base
+            elif v.duration and v.time_base:
+                dur = float(v.duration * v.time_base)
+            else:
+                dur = 0.0
+            return w, h, dur
+    except Exception:  # noqa: BLE001 - unreadable/odd file: treat as not-oversized
+        return 0, 0, 0.0
+
+
+def is_oversized(path: Path, size_bytes: float) -> bool:
+    """True iff *path* is too costly to hash and should be skipped entirely.
+
+    Requires ALL THREE: file size > SKIP_MIN_SIZE_BYTES, duration >
+    SKIP_MIN_DURATION_S, and resolution >= 4K. Evaluated cheapest-first: the
+    free size gate first, then a single metadata probe (duration + resolution)
+    only when size qualifies -- so the common small video never opens a file
+    here, preserving sync's fast path.
+
+    Both the duration and resolution come from the SAME container-metadata probe
+    (`_probe_dims_duration`), so the decision is self-consistent and identical on
+    every run (it never mixes the probe's container duration with a record's
+    last-frame-timestamp duration, which differ near the threshold).
+    """
+    if size_bytes <= SKIP_MIN_SIZE_BYTES:
+        return False
+    w, h, dur = _probe_dims_duration(path)
+    if dur <= SKIP_MIN_DURATION_S:
+        return False
+    return w >= SKIP_MIN_WIDTH or h >= SKIP_MIN_HEIGHT
+
+
 def assemble_record(path: Path, fid: str, features: list[FrameFeature],
                     params: HashParams,
                     stat_pair: list[float] | None = None) -> VideoRecord:
@@ -247,6 +298,7 @@ class SyncStats:
     removed: int = 0
     failed: int = 0
     duplicate_copies: int = 0  # byte-identical files sharing one record
+    skipped_oversized: int = 0  # too-costly files excluded (never hashed)
 
 
 def _write_manifest(root: Path, params: HashParams,
@@ -467,6 +519,7 @@ def sync(root: str | Path, params: HashParams,
         old_home: Path | None = None            # prior record folder, if it moved
 
     plans: dict[str, _Plan] = {}
+    skipped_fids: set[str] = set()   # previously-cached fids now excluded as oversized
 
     # ---- Phase 1: classify every file (cheap; no frame decoding) ----
     files = list(iter_video_files(root))
@@ -477,6 +530,32 @@ def sync(root: str | Path, params: HashParams,
             sp = _stat_pair(path)
         except OSError:
             stats.failed += 1
+            continue
+
+        # Oversized exclusion (always on): a 4K + long + large file is too
+        # costly to hash, so skip it entirely -- no plan, no record, and
+        # therefore absent from the index and from find/pairs. The size gate is
+        # the free fast-path short-circuit so the metadata probe inside
+        # is_oversized only runs for the rare big file; `is_oversized` itself
+        # re-checks size, so this stays correct if that pre-filter is ever
+        # dropped. The video file is never touched. Any existing record for it is
+        # dropped in the cleanup pass, since a skipped file never enters `plans`.
+        if sp[0] > SKIP_MIN_SIZE_BYTES and is_oversized(path, sp[0]):
+            # Resolve the content id so byte-identical copies of one oversized
+            # video count once (mirroring how duplicate_copies collapses them),
+            # and so the cleanup pass drops its stale record as a "skip" not a
+            # "removed" (the video is still present, just excluded now).
+            hit0 = stat_lookup.get(rp)
+            if hit0 is not None and hit0[1] == sp:
+                fid = hit0[0]
+            else:
+                try:
+                    fid = file_id(path)
+                except OSError:
+                    fid = rp  # fall back to path identity; still de-dupes self
+            if fid not in skipped_fids:
+                stats.skipped_oversized += 1
+                skipped_fids.add(fid)
             continue
 
         # Fast-path: known path with unchanged size+mtime -> reuse cached fid,
@@ -632,7 +711,10 @@ def sync(root: str | Path, params: HashParams,
         if fid not in plans:
             for p in paths:
                 p.unlink(missing_ok=True)
-            stats.removed += 1
+            # A now-excluded oversized file's stale record is dropped here too,
+            # but it's a skip (file still present), not a genuine removal.
+            if fid not in skipped_fids:
+                stats.removed += 1
         elif home is not None:
             keep = record_path(home, fid).resolve()
             for p in paths:

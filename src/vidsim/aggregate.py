@@ -109,14 +109,40 @@ def _collect_hits(
     return hits
 
 
+def _median_sampling_interval(query: VideoRecord) -> float | None:
+    """Median spacing between the query's consecutive sampled-frame timestamps.
+
+    This is the real sampling interval the frames were produced at (whatever
+    --seconds-per-hash was), recovered from the data so it works on any cache.
+    Returns None when there are too few frames to tell.
+    """
+    ts = sorted(f.timestamp for f in query.features)
+    if len(ts) < 2:
+        return None
+    gaps = [b - a for a, b in zip(ts, ts[1:]) if b > a]
+    if not gaps:
+        return None
+    return float(np.median(gaps))
+
+
 def _vote_segments(
-    hits: list[tuple[float, float]], mp: MatchParams
+    hits: list[tuple[float, float]], mp: MatchParams,
+    sampling_interval: float | None = None,
 ) -> list[Segment]:
     """Temporal Hough voting -> list of aligned segments for one target.
 
     hits: list of (b_time, a_time). We bin delta = a - b, find peaks, and for
     each peak recover the covered span. Burst weighting: votes for a given
     b_time are shared across the target frames it matched.
+
+    `sampling_interval` is the spacing (seconds) between consecutive sampled
+    frames. Consecutive aligned frames of a genuine shared segment are ~one
+    interval apart, so the run-splitting gap must scale with it: at a coarse
+    sampling rate (e.g. --seconds-per-hash 5) a fixed 3s gap would split every
+    legitimate run into single frames and destroy all matching. The effective
+    gap is max(mp.max_frame_gap_s, 2.5 x interval) -- it tolerates a couple of
+    dropped/low-quality frames without bridging true gaps. When the interval is
+    unknown (None/<=0) we fall back to the bare constant.
     """
     if not hits:
         return []
@@ -140,10 +166,38 @@ def _vote_segments(
 
     segments: list[Segment] = []
     min_frames = mp.min_segment_frames
+    max_gap = mp.max_frame_gap_s
+    if sampling_interval is not None and sampling_interval > 0:
+        max_gap = max(max_gap, 2.5 * sampling_interval)
 
-    # Each sufficiently-voted bin (and its tolerance-neighbours) is a segment.
+    def _runs(members: list[tuple[float, float, float]]
+              ) -> list[list[tuple[float, float, float]]]:
+        """Split an offset bin's members into temporally-contiguous runs.
+
+        Members share an offset but need NOT be adjacent in time: a handful of
+        matches scattered across B is noise, not a shared segment. Sort by
+        B-time and start a new run wherever consecutive B-times jump by more
+        than `max_gap`. Each run is one genuine shared stretch.
+        """
+        ordered = sorted(members, key=lambda m: m[0])  # by b-time
+        runs: list[list[tuple[float, float, float]]] = []
+        cur: list[tuple[float, float, float]] = []
+        prev_b: float | None = None
+        for m in ordered:
+            b = m[0]
+            if prev_b is not None and b - prev_b > max_gap:
+                runs.append(cur)
+                cur = []
+            cur.append(m)
+            prev_b = b
+        if cur:
+            runs.append(cur)
+        return runs
+
+    # Each sufficiently-voted bin (and its tolerance-neighbours) is a candidate.
     # Process strongest first; consume neighbouring bins so one physical segment
-    # isn't split across two adjacent keys.
+    # isn't split across two adjacent keys. Then split each bin into contiguous
+    # time-runs so scattered same-offset matches don't become one fat segment.
     consumed: set[int] = set()
     for key in sorted(bin_votes, key=lambda k: bin_votes[k], reverse=True):
         if key in consumed:
@@ -153,22 +207,23 @@ def _vote_segments(
             if nb in bin_members and nb not in consumed:
                 members.extend(bin_members[nb])
                 consumed.add(nb)
-        # Distinct aligned query frames in this segment.
-        b_times = sorted({round(b, 3) for b, _, _ in members})
-        if len(b_times) < min_frames:
-            continue
-        a_vals = [a for _, a, _ in members]
-        deltas = [d for _, _, d in members]
-        segments.append(
-            Segment(
-                q_start=min(b for b, _, _ in members),
-                q_end=max(b for b, _, _ in members),
-                t_start=min(a_vals),
-                t_end=max(a_vals),
-                offset=float(np.median(deltas)),
-                frames=len(b_times),
+        for run in _runs(members):
+            # Distinct aligned query frames in this run.
+            b_times = {round(b, 3) for b, _, _ in run}
+            if len(b_times) < min_frames:
+                continue
+            a_vals = [a for _, a, _ in run]
+            deltas = [d for _, _, d in run]
+            segments.append(
+                Segment(
+                    q_start=min(b for b, _, _ in run),
+                    q_end=max(b for b, _, _ in run),
+                    t_start=min(a_vals),
+                    t_end=max(a_vals),
+                    offset=float(np.median(deltas)),
+                    frames=len(b_times),
+                )
             )
-        )
     return segments
 
 
@@ -202,22 +257,24 @@ def compare(
     q_duration = query.duration or max(
         (f.timestamp for f in query.features), default=0.0
     )
+    # Actual sampling interval, inferred from the query's own frame timestamps
+    # (median spacing between consecutive samples). This is the true spacing the
+    # frames were sampled at, whatever --seconds-per-hash was used, and works on
+    # old caches too. Passed to _vote_segments so run-splitting scales with it.
+    sampling_interval = _median_sampling_interval(query)
     hits_by_target = _collect_hits(query, frame_index, mp)
 
     results: list[PairResult] = []
     for tgt, hits in hits_by_target.items():
         if len(hits) < mp.min_shared_frames:
             continue
-        segments = _vote_segments(hits, mp)
+        segments = _vote_segments(hits, mp, sampling_interval)
         if not segments:
             continue
         # Coverage of B = merged length of segment spans in B / B duration.
         spans = [(s.q_start, s.q_end) for s in segments]
         merged = _merge_spans(spans, gap=mp.offset_tolerance_s)
         covered = sum(e - s for s, e in merged)
-        # Each aligned frame represents ~seconds_per_hash of content; add one
-        # sampling interval so a single-frame-wide span isn't counted as zero.
-        covered += len(merged) * 0  # spans already span first..last matched frame
         coverage = min(1.0, covered / q_duration) if q_duration > 0 else 0.0
 
         tgt_rec = targets.get(tgt)
