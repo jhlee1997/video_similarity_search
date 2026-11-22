@@ -43,6 +43,12 @@ from .hashing import FrameFeature, hash_video
 
 VPDQ_VERSION = importlib.metadata.version("vpdq")
 
+# Collection-level JSON files that live in the ROOT's .vidsim/ and are NOT
+# per-video records. `_scan_record_files` must skip these, or sync's cleanup
+# deletes them as "stale records" (keyed by filename stem). Keep in sync with
+# any new root-level JSON (pairs cache, ignore list, manifest).
+_RESERVED_VIDSIM_JSON = {"collection.json", "pairs.json", "pairs_ignore.json"}
+
 
 @dataclass
 class VideoRecord:
@@ -125,16 +131,20 @@ def _scan_record_files(root: Path) -> dict[str, list[Path]]:
 
     A given content may (through partial earlier runs or migration) have a
     record file in more than one folder; we collect them all so the caller can
-    keep one and delete the rest. Only `<fid>.json` files are considered: the
-    `*.json` glob already excludes `index.faiss`/`rowmap.npz`, and we skip
-    `collection.json` explicitly.
+    keep one and delete the rest. Only per-video `<fid>.json` files are
+    considered: the `*.json` glob already excludes `index.faiss`/`rowmap.npz`,
+    and we skip the collection-level JSON files (`collection.json`, `pairs.json`,
+    the ignore list) explicitly -- otherwise they'd be mistaken for a stale video
+    record (keyed by their stem) and DELETED by sync's cleanup. (This bit
+    `pairs.json`: it was silently removed on every cache-build, so `pairs` always
+    fell back to a full scan.)
     """
     found: dict[str, list[Path]] = {}
     for vd in root.rglob(VIDSIM_DIRNAME):
         if not vd.is_dir():
             continue
         for p in vd.glob("*.json"):
-            if p.name == "collection.json":
+            if p.name in _RESERVED_VIDSIM_JSON:
                 continue
             fid = p.stem
             found.setdefault(fid, []).append(p)

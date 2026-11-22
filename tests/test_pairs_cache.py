@@ -1,15 +1,9 @@
 """Tests for the incremental pairs cache.
 
-The core property we verify: on a collection where matches are SYMMETRIC (both
-videos retrieve each other as kNN neighbours), the incrementally-maintained pair
-set equals a from-scratch full scan. We build a small synthetic FrameIndex +
-records (no real video needed) so the aggregator runs on controlled frame
-hashes, then exercise add / batch-add / remove against a full scan.
-
-NOTE: incremental is a close APPROXIMATION of a full scan, NOT exact in general
--- a reverse pair can be missed under asymmetric kNN (see
-aggregate.compare_bidirectional). These fixtures are symmetric, so equivalence
-holds here; `pairs --refresh` is the exact rebuild in the real tool.
+We build a small synthetic FrameIndex + records (no real video needed) so the
+aggregator runs on controlled frame hashes, then exercise add / batch-add /
+remove and check the incremental result against a full scan. Also guards the
+cache file against being deleted by cache-build's record cleanup.
 """
 from __future__ import annotations
 
@@ -162,3 +156,28 @@ def test_load_corrupt_returns_none(tmp_path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("{ not valid json")
     assert pairs_cache.load(tmp_path) is None
+
+
+# ---- regression: cache-build must not delete the pairs cache --------------
+
+def test_reserved_json_not_treated_as_record(tmp_path) -> None:
+    """collection.json / pairs.json / pairs_ignore.json in a .vidsim/ dir must
+    NOT be picked up by _scan_record_files as per-video records -- otherwise
+    sync's cleanup deletes them as 'stale records', which silently wiped the
+    pairs cache on every cache-build (so `pairs` always fell back to full scan)."""
+    from vidsim.cache import _scan_record_files
+    from vidsim.config import VIDSIM_DIRNAME
+
+    vd = tmp_path / VIDSIM_DIRNAME
+    vd.mkdir(parents=True)
+    # a genuine per-video record (64-hex-ish stem) + the reserved root files
+    (vd / "abc123.json").write_text("{}")
+    (vd / "collection.json").write_text("{}")
+    (vd / "pairs.json").write_text("{}")
+    (vd / "pairs_ignore.json").write_text("{}")
+
+    found = _scan_record_files(tmp_path)
+    assert "abc123" in found                 # real record IS scanned
+    assert "pairs" not in found              # reserved files are NOT
+    assert "collection" not in found
+    assert "pairs_ignore" not in found
