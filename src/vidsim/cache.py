@@ -637,11 +637,13 @@ def sync(root: str | Path, params: HashParams,
     to_hash = [(p.hash_path, fid) for fid, p in plans.items() if p.kind != "cached"]
     done_fids: set[str] = set()
 
-    # Collection-level status (distinct from the per-run hashing bar below): how
-    # much of the whole library is already cached. `plans` holds every video seen
-    # this run; to_hash is the subset still needing work.
-    if plans:
-        ui.collection_status(cached=len(plans) - len(to_hash), total=len(plans))
+    # Collection-level status: how much of the whole collection is cached.
+    # `plans` holds every video seen this run; to_hash is the subset still
+    # needing work. When there IS work to do, the live collection bar inside
+    # WorkerBars shows this (and climbs), so only print the one-shot snapshot
+    # line here when there's nothing to hash (no WorkerBars gets created).
+    if plans and not to_hash:
+        ui.collection_status(cached=len(plans), total=len(plans))
 
     if to_hash:
         # --- Progress weight per file (DURATION), computed parent-side, no worker
@@ -676,8 +678,8 @@ def sync(root: str | Path, params: HashParams,
 
         bars = ui.WorkerBars(total_units, len(to_hash),
                              workers if workers > 1 else 0,
-                             library_cached=len(plans) - len(to_hash),
-                             library_total=len(plans))
+                             collection_cached=len(plans) - len(to_hash),
+                             collection_total=len(plans))
 
         if workers == 1:
             for path, fid in to_hash:
