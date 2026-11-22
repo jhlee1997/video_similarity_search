@@ -24,6 +24,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from tqdm import tqdm
+
 from .aggregate import PairResult, compare_bidirectional
 from .cache import VideoRecord
 from .config import pairs_cache_path
@@ -66,18 +68,23 @@ def clear(root: str | Path) -> None:
 
 
 def full_scan(records: dict[str, VideoRecord], idx: FrameIndex,
-              mp: MatchParams) -> list[PairResult]:
+              mp: MatchParams, progress: bool = False) -> list[PairResult]:
     """Compute every pair from scratch (used for the first run and --refresh).
 
     Uses the plain directional `compare` per video -- equivalent to the old
     pairs loop, but stores ALL pairs (no coverage filter) so the cache is a
-    superset the display threshold can filter freely.
+    superset the display threshold can filter freely. When *progress* is true,
+    shows a per-video tqdm bar on stderr (the scan is the long part).
     """
     from .aggregate import compare
 
     out: list[PairResult] = []
-    for rec in records.values():
+    bar = tqdm(records.values(), total=len(records), desc="comparing",
+               unit="vid", disable=not progress)
+    for rec in bar:
         out.extend(compare(rec, idx, mp, records))
+        bar.set_postfix_str(f"{len(out)} pairs", refresh=False)
+    bar.close()
     return out
 
 
@@ -87,6 +94,7 @@ def incremental_update(
     records: dict[str, VideoRecord],
     idx: FrameIndex,
     mp: MatchParams,
+    progress: bool = False,
 ) -> tuple[list[PairResult], set[str], set[str]]:
     """Return (merged_results, added, removed) updating only what changed.
 
@@ -107,12 +115,15 @@ def incremental_update(
     # ordered (query, target) key: a pair between two added videos is emitted by
     # each endpoint's compare_bidirectional, so collapse duplicates.
     new_by_key: dict[tuple[str, str], PairResult] = {}
-    for fid in added:
+    bar = tqdm(sorted(added), total=len(added), desc="comparing (added)",
+               unit="vid", disable=not progress)
+    for fid in bar:
         rec = records.get(fid)
         if rec is None:
             continue
         for r in compare_bidirectional(rec, idx, mp, records):
             new_by_key[(r.query_id, r.target_id)] = r
+    bar.close()
 
     merged = kept + list(new_by_key.values())
     merged.sort(key=lambda r: r.coverage, reverse=True)

@@ -256,10 +256,10 @@ def pairs_cmd(collection: Path, frame_radius: int | None,
     if cached is not None:
         cached_fids, cached_results = cached
         all_pairs, added, removed = pairs_cache.incremental_update(
-            cached_fids, cached_results, records, idx, mp)
+            cached_fids, cached_results, records, idx, mp, progress=not as_json)
         cache_status = f"incremental: +{len(added)} / -{len(removed)} video(s)"
     else:
-        all_pairs = pairs_cache.full_scan(records, idx, mp)
+        all_pairs = pairs_cache.full_scan(records, idx, mp, progress=not as_json)
         cache_status = "full scan (no cache used)"
 
     # Persist the full (unfiltered) pair set unless caching is disabled.
