@@ -66,9 +66,10 @@ def note(msg: str) -> None:
 
 
 def collection_status(cached: int, total: int) -> None:
-    """One-shot collection-level 'how much of the library is cached' bar + text,
-    distinct from the per-run hashing bar (which only covers this run's work).
-    A static (non-updating) bar drawn once to stderr; pure display, no state."""
+    """One-shot collection-level 'how much of the library is cached' line, drawn
+    once to stderr before hashing starts. During hashing the live library count
+    is carried in the hashing bar's postfix (see WorkerBars), which ticks up as
+    each file completes; this line is the starting snapshot. Pure display."""
     try:
         total = max(0, int(total))
         cached = max(0, min(int(cached), total))
@@ -104,11 +105,18 @@ class WorkerBars:
     """
 
     def __init__(self, total_units: float, n_files: int, workers: int,
-                 enabled: bool | None = None):
+                 enabled: bool | None = None,
+                 library_cached: int = 0, library_total: int = 0):
         from tqdm import tqdm
 
         self.n_files = n_files
         self.done_files = 0
+        # Live library progress: how many of the WHOLE collection are cached.
+        # Baseline = already-cached before this run; each finished file adds one.
+        # Shown in the hashing bar's postfix so it ticks up live without any new
+        # bar or any worker-side machinery (parent bookkeeping only).
+        self.library_base = max(0, int(library_cached))
+        self.library_total = max(0, int(library_total))
         self.enabled = is_tty() if enabled is None else enabled
         self._total = max(1.0, float(total_units))
         self._progress = 0.0
@@ -132,8 +140,12 @@ class WorkerBars:
 
     def _set_postfix(self) -> None:
         if self.overall is not None:
-            self.overall.set_postfix_str(f"files {self.done_files}/{self.n_files}",
-                                         refresh=True)
+            msg = f"files {self.done_files}/{self.n_files}"
+            if self.library_total > 0:
+                lib = min(self.library_base + self.done_files, self.library_total)
+                lib_pct = lib / self.library_total * 100
+                msg += f" | library {lib}/{self.library_total} ({lib_pct:3.0f}%)"
+            self.overall.set_postfix_str(msg, refresh=True)
 
     def set_slot(self, slot: int, name: str) -> None:
         try:

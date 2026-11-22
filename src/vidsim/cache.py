@@ -675,7 +675,9 @@ def sync(root: str | Path, params: HashParams,
         total_units = sum(weight_by_fid.values())
 
         bars = ui.WorkerBars(total_units, len(to_hash),
-                             workers if workers > 1 else 0)
+                             workers if workers > 1 else 0,
+                             library_cached=len(plans) - len(to_hash),
+                             library_total=len(plans))
 
         if workers == 1:
             for path, fid in to_hash:
