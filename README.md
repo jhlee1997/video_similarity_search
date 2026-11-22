@@ -256,6 +256,13 @@ recompute **only the videos added or removed** since the last run (everything
 else is reused), so re-running `pairs` after adding a handful of videos is nearly
 instant instead of a full re-scan.
 
+> **Run `cache-build` first after any add/remove.** `pairs` is a pure read: it
+> detects added/removed videos by diffing the records that `cache-build` writes,
+> not by scanning your folders. So whenever you add, remove, or replace videos,
+> run `cache-build` **before** `pairs` (and `find`) — otherwise `pairs` won't see
+> new videos and will still report removed ones. Both steps are incremental, so
+> the add/remove → `cache-build` → `pairs` sequence stays fast.
+
 - `--min-coverage` is a **display filter** over the cached pairs — the cache
   stores every pair, so changing the threshold (e.g. `--min-coverage 0.5` to see
   only strong matches) never triggers a recompute.
@@ -265,12 +272,12 @@ instant instead of a full re-scan.
   `--frame-radius` or `--min-shared-frames`, or update the matching code, **delete
   `.vidsim/pairs.json`** (or use `--refresh`) so stale pairs aren't reused.
 
-> **Incremental is an approximation, not an exact rebuild.** The frame search is
-> approximate (k-nearest-neighbour), so the incremental update can occasionally
-> miss a weak reverse match that a from-scratch scan would surface, and a removal
-> keeps surviving pairs as they were last computed. These differences are small
-> and at the edges; run `vidsim pairs --refresh` whenever you want a guaranteed
-> exact, from-scratch result.
+> **What the cache stores.** It keeps the directional result for every pair that
+> shares content (above the internal `min-shared-frames` floor); a pair with no
+> shared frames simply has no entry (which reads as 0% — correct). `--min-coverage`
+> filters what's *shown* from this stored set. `--refresh` recomputes the whole
+> set from scratch (same matching as an incremental run — use it if you ever
+> suspect the cache drifted, e.g. after changing matching settings or the code).
 
 ### Rebuild just the index
 
