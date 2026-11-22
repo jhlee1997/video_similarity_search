@@ -206,17 +206,32 @@ def find_cmd(video: Path, collection: Path, seconds_per_hash: float,
 @click.option("--min-shared-frames", type=int, default=None,
               help="Min candidate frame matches before scoring a pair.")
 @click.option("--min-coverage", type=float, default=None,
-              help="Only report a pair if a direction reaches this coverage.")
+              help="Only SHOW a pair if a direction reaches this coverage "
+                   "(display filter; the cache stores all pairs).")
+@click.option("--refresh", is_flag=True,
+              help="Ignore the cache: recompute all pairs from scratch and "
+                   "overwrite the cache.")
+@click.option("--no-cache", is_flag=True,
+              help="Compute fresh without reading or writing the pairs cache.")
 @click.option("--json", "as_json", is_flag=True)
 def pairs_cmd(collection: Path, frame_radius: int | None,
               min_shared_frames: int | None, min_coverage: float | None,
-              as_json: bool) -> None:
+              refresh: bool, no_cache: bool, as_json: bool) -> None:
     """Scan COLLECTION; report how much each video draws from another.
 
     Directional: a pair may appear twice (B drawn from A, and A drawn from B)
     when both directions reach the coverage threshold -- e.g. duplicates show
     ~100% both ways, a subset shows high one way and low the other.
+
+    Results are cached in the collection's .vidsim/pairs.json and updated
+    INCREMENTALLY: a rerun recomputes only videos added or removed since the
+    last run. --min-coverage is a display filter over the cached pairs (never
+    forces a recompute). If you change --frame-radius / --min-shared-frames or
+    the matching code, delete .vidsim/pairs.json (or use --refresh) so stale
+    pairs aren't reused.
     """
+    from . import pairs_cache
+
     root = _resolve_for_read(collection)
     idx = FrameIndex.load(root)
     if idx is None:
@@ -234,24 +249,36 @@ def pairs_cmd(collection: Path, frame_radius: int | None,
         ui.header("Scanning for related pairs",
                   detail=f"{len(records)} videos in {root}")
 
-    collected = []
-    # Self-updating bar on stderr (suppressed for --json so machine output stays
-    # clean). Live postfix shows how many related pairs found so far.
     t0 = time.perf_counter()
-    bar = tqdm(records.items(), total=len(records), desc="comparing",
-               unit="vid", disable=as_json)
-    for fid, rec in bar:
-        for r in compare(rec, idx, mp, records):
-            if r.coverage >= mp.report_coverage:
-                collected.append(r)
-        bar.set_postfix_str(f"{len(collected)} pairs", refresh=False)
-    bar.close()
+    current = set(records)
+
+    cached = None if (refresh or no_cache) else pairs_cache.load(root)
+    if cached is not None:
+        cached_fids, cached_results = cached
+        all_pairs, added, removed = pairs_cache.incremental_update(
+            cached_fids, cached_results, records, idx, mp)
+        cache_status = f"incremental: +{len(added)} / -{len(removed)} video(s)"
+    else:
+        all_pairs = pairs_cache.full_scan(records, idx, mp)
+        cache_status = "full scan (no cache used)"
+
+    # Persist the full (unfiltered) pair set unless caching is disabled.
+    if not no_cache:
+        try:
+            pairs_cache.save(root, current, all_pairs)
+        except Exception:  # noqa: BLE001 - a cache write must NEVER fail the read
+            pass
+
     dt = time.perf_counter() - t0
 
+    # --min-coverage is a pure DISPLAY filter over the cached superset.
+    collected = [r for r in all_pairs if r.coverage >= mp.report_coverage]
     collected.sort(key=lambda r: r.coverage, reverse=True)
+
     if not as_json:
         ui.summary([("videos scanned", len(records)),
                     ("related pairs", len(collected)),
+                    ("pairs cache", cache_status),
                     ("elapsed", ui.elapsed(dt))])
         click.echo(err=True)  # clean blank line before the report on stdout
 

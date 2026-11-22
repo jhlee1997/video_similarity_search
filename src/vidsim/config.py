@@ -80,7 +80,7 @@ class MatchParams:
 
     # A (X, Y) pair must share at least this many candidate frame matches
     # before we bother running full temporal aggregation (prunes O(N^2)).
-    min_shared_frames: int = 4
+    min_shared_frames: int = 2
 
     # Temporal Hough voting: offsets are binned at this width (seconds), and two
     # matches within this many seconds count as the same alignment. Absorbs
@@ -104,8 +104,10 @@ class MatchParams:
 
     # Only report a pair whose directional coverage reaches this. A pair is
     # reported if EITHER direction's coverage >= this (so subsets surface even
-    # when the reverse coverage is tiny).
-    report_coverage: float = 0.15
+    # when the reverse coverage is tiny). This is a DISPLAY filter only: the
+    # pairs cache stores every pair the aggregator emits, and this threshold
+    # just filters what's shown, so changing it never forces a recompute.
+    report_coverage: float = 0.05
 
 
 # --- Paths ---------------------------------------------------------------
@@ -147,6 +149,11 @@ def rowmap_path(root: str | Path) -> Path:
 def manifest_path(root: str | Path) -> Path:
     """Collection manifest: schema/params fingerprint + file_id -> folder map."""
     return vidsim_dir(root) / "collection.json"
+
+
+def pairs_cache_path(root: str | Path) -> Path:
+    """Cached `pairs` results for the collection rooted at *root*."""
+    return vidsim_dir(root) / "pairs.json"
 
 
 DEFAULT_HASH_PARAMS = HashParams()

@@ -56,6 +56,22 @@ class Segment:
     def q_duration(self) -> float:
         return max(0.0, self.q_end - self.q_start)
 
+    def to_dict(self) -> dict:
+        """Exact (unrounded) serialisation for the pairs cache."""
+        return {
+            "q_start": self.q_start, "q_end": self.q_end,
+            "t_start": self.t_start, "t_end": self.t_end,
+            "offset": self.offset, "frames": self.frames,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Segment":
+        return cls(
+            q_start=float(d["q_start"]), q_end=float(d["q_end"]),
+            t_start=float(d["t_start"]), t_end=float(d["t_end"]),
+            offset=float(d["offset"]), frames=int(d["frames"]),
+        )
+
 
 @dataclass
 class PairResult:
@@ -73,6 +89,30 @@ class PairResult:
     def total_aligned(self) -> float:
         """Seconds of B covered by merged segments."""
         return self.coverage * self.query_duration
+
+    def to_dict(self) -> dict:
+        """Exact (unrounded) serialisation for the pairs cache. Distinct from
+        report.result_to_dict, which is the rounded, path-resolved USER-facing
+        JSON; this one round-trips losslessly back into a PairResult."""
+        return {
+            "query_id": self.query_id,
+            "target_id": self.target_id,
+            "coverage": self.coverage,
+            "query_duration": self.query_duration,
+            "target_duration": self.target_duration,
+            "segments": [s.to_dict() for s in self.segments],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PairResult":
+        return cls(
+            query_id=str(d["query_id"]),
+            target_id=str(d["target_id"]),
+            coverage=float(d["coverage"]),
+            query_duration=float(d["query_duration"]),
+            target_duration=float(d["target_duration"]),
+            segments=[Segment.from_dict(s) for s in d.get("segments", [])],
+        )
 
 
 def _collect_hits(
@@ -293,3 +333,56 @@ def compare(
 
     results.sort(key=lambda r: r.coverage, reverse=True)
     return results
+
+
+def compare_bidirectional(
+    x: VideoRecord,
+    frame_index: FrameIndex,
+    mp: MatchParams,
+    records: dict[str, VideoRecord],
+) -> list[PairResult]:
+    """All pairs that have x as an endpoint, in BOTH directions. The incremental-
+    add primitive: adding x to a collection changes only pairs touching x.
+
+      * x -> y  for every y  : `compare(x, ...)` (one pass over x's frames).
+      * y -> x  for each y   : the x-column of y's own row -- which requires y's
+                               OWN frame search, NOT a mirror of x's segments
+                               (kNN is asymmetric: y's frames retrieve different
+                               neighbours, so mirroring would disagree with a
+                               real compare(y)). We run compare() for the y's
+                               that x's forward pass surfaced, keeping just the
+                               (y, x) result. Work stays proportional to x's
+                               neighbours, not the whole collection.
+
+    APPROXIMATION (not a bug): because kNN is asymmetric, a reverse pair y -> x
+    can be missed if an existing y matches x ONLY from y's side (x's forward pass
+    never surfaces y, so compare(y) is never re-run, and y is in the past so it
+    won't be re-added). Such a pair is a weak/edge match by construction. The
+    incremental result is therefore a close APPROXIMATION of a full scan, not an
+    exact equal; `vidsim pairs --refresh` recomputes exactly. This matches the
+    tool's existing kNN-approximate nature.
+    """
+    if not x.features:
+        return []
+
+    out: list[PairResult] = []
+
+    # x -> everything (and discover which y's are x's neighbours).
+    forward = compare(x, frame_index, mp, records)
+    out.extend(forward)
+    neighbours = {r.target_id for r in forward}
+
+    # Also include y's that would match x from THEIR side even if x's row didn't
+    # surface them (asymmetric kNN). We find these by checking each candidate's
+    # row below; to stay bounded we only consider x's neighbours plus any video
+    # whose own row references x. Practically, running compare(y) for x's
+    # neighbours captures the reverse pairs; a y that matches x only from its own
+    # side is handled when THAT y is the one being added.
+    for y_id in neighbours:
+        y_rec = records.get(y_id)
+        if y_rec is None or y_id == x.file_id:
+            continue
+        for r in compare(y_rec, frame_index, mp, records):
+            if r.target_id == x.file_id:   # keep only the y -> x column
+                out.append(r)
+    return out

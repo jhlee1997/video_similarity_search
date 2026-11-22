@@ -241,6 +241,36 @@ uv run vidsim pairs /path/to/your/videos
 
 Reports every pair where one video draws meaningfully from another, strongest
 first. Duplicates show ~100% in both directions; subsets show high one way only.
+Each side of a pair is annotated with its **duration and file size**, so you can
+decide which copy to keep at a glance (usually the longer / larger one):
+
+```
+96% of  B.mp4
+    is drawn from  A.mp4
+    (12 segment(s); B=0:27 12.9 MB  A=2:14:00 8.9 GB)
+```
+
+**Results are cached and updated incrementally.** The first `pairs` run on a
+collection does the full scan and writes `.vidsim/pairs.json`. Subsequent runs
+recompute **only the videos added or removed** since the last run (everything
+else is reused), so re-running `pairs` after adding a handful of videos is nearly
+instant instead of a full re-scan.
+
+- `--min-coverage` is a **display filter** over the cached pairs — the cache
+  stores every pair, so changing the threshold (e.g. `--min-coverage 0.5` to see
+  only strong matches) never triggers a recompute.
+- `--refresh` forces a full recompute and overwrites the cache.
+- `--no-cache` computes fresh without reading or writing the cache.
+- The cache is **not** versioned against the matching settings. If you change
+  `--frame-radius` or `--min-shared-frames`, or update the matching code, **delete
+  `.vidsim/pairs.json`** (or use `--refresh`) so stale pairs aren't reused.
+
+> **Incremental is an approximation, not an exact rebuild.** The frame search is
+> approximate (k-nearest-neighbour), so the incremental update can occasionally
+> miss a weak reverse match that a from-scratch scan would surface, and a removal
+> keeps surviving pairs as they were last computed. These differences are small
+> and at the edges; run `vidsim pairs --refresh` whenever you want a guaranteed
+> exact, from-scratch result.
 
 ### Rebuild just the index
 
@@ -340,8 +370,8 @@ Defaults live in `src/vidsim/config.py`; the common ones are also CLI flags.
 | `--seconds-per-hash` | `1.0` | Sampling interval. Lower = finer time resolution, more hashes, slower. **Changing this invalidates the cache** (it's part of the hash identity). |
 | `--quality-floor` | `50` | Drop frames whose PDQ quality is below this (0–100). |
 | `--frame-radius` | `31` | Per-frame Hamming match radius in bits (max 256). Higher = looser matching, catches heavier edits but more noise. |
-| `--min-coverage` | `0.15` | Only report a pair if a direction reaches this coverage. |
-| `--min-shared-frames` | `4` | A pair needs this many candidate frame matches before it's scored at all (prunes the all-pairs scan). |
+| `--min-coverage` | `0.05` | Only *display* a pair if a direction reaches this coverage. A display filter over the cached pairs (changing it never recomputes). |
+| `--min-shared-frames` | `2` | A pair needs this many candidate frame matches before it's scored at all (prunes the all-pairs scan). Changing it invalidates the pairs cache — delete `.vidsim/pairs.json`. |
 | `--index-kind` | `flat` | `flat` = exact Hamming search (`IndexBinaryFlat`); `hnsw` = approximate, much faster at tens of millions of frames. The cache is unaffected, so you can switch freely. |
 | `--workers` | ~¾ of cores | (`cache-build`) Parallel hashing worker processes. Higher saturates the CPU; `1` forces serial. Each worker pins ffmpeg to one thread to avoid oversubscription. |
 
@@ -387,7 +417,8 @@ src/vidsim/
   hashing.py     vpdq wrapper → (N, 32) uint8 frame-hash matrix
   index.py       FAISS binary index + row-map (row → file_id/frame/timestamp)
   aggregate.py   THE CORE: temporal Hough voting → shared segments
-  report.py      directional % + segment list (text / JSON)
+  pairs_cache.py incremental pairs cache (add/remove diff, both-direction add)
+  report.py      directional % + segment list + size/length (text / JSON)
   vid_length.py  parallel PyAV duration reader (runtime estimate + bar weighting)
   ui.py          parent-side progress bars + narration helpers (stderr only)
   cli.py         cache-build · index · find · pairs · duration

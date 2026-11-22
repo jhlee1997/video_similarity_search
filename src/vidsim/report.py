@@ -27,15 +27,55 @@ def _short_path(rec: VideoRecord | None, fid: str) -> str:
     return f"<{fid[:12]}>"
 
 
+def _size_bytes(rec: VideoRecord | None) -> int:
+    """Best-known file size (bytes) for a record, from its stat_by_path.
+
+    Uses the stat for the record's primary path when available, else any stat;
+    0 when unknown (pre-stat records or missing data)."""
+    if not rec or not rec.stat_by_path:
+        return 0
+    primary = rec.paths[0] if rec.paths else None
+    sp = rec.stat_by_path.get(primary) if primary else None
+    if sp is None:
+        sp = next(iter(rec.stat_by_path.values()), None)
+    try:
+        return int(sp[0]) if sp else 0
+    except (TypeError, ValueError, IndexError):
+        return 0
+
+
+def _human_size(n: int) -> str:
+    """Human-readable file size, e.g. '8.9 GB', '540 MB'."""
+    if n <= 0:
+        return "?"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    f = float(n)
+    i = 0
+    while f >= 1000 and i < len(units) - 1:
+        f /= 1000.0
+        i += 1
+    # Pick the display precision, then roll up one more unit if rounding would
+    # render "1000" (e.g. 999.6 MB -> "1.0 GB", not "1000 MB").
+    decimals = 0 if (i == 0 or f >= 100) else 1
+    if round(f, decimals) >= 1000 and i < len(units) - 1:
+        f /= 1000.0
+        i += 1
+        decimals = 1
+    return f"{f:.{decimals}f} {units[i]}"
+
+
 def format_result_line(r: PairResult, records: dict[str, VideoRecord]) -> str:
-    b = _short_path(records.get(r.query_id), r.query_id)
-    a = _short_path(records.get(r.target_id), r.target_id)
+    b_rec = records.get(r.query_id)
+    a_rec = records.get(r.target_id)
+    b = _short_path(b_rec, r.query_id)
+    a = _short_path(a_rec, r.target_id)
 
     header = (
         f"{int(round(r.coverage * 100))}% of  {b}\n"
         f"    is drawn from  {a}\n"
         f"    ({len(r.segments)} segment(s); "
-        f"B={_hms(r.query_duration)} A={_hms(r.target_duration)})"
+        f"B={_hms(r.query_duration)} {_human_size(_size_bytes(b_rec))}  "
+        f"A={_hms(r.target_duration)} {_human_size(_size_bytes(a_rec))})"
     )
     lines = [header]
     for seg in r.segments:
@@ -56,6 +96,8 @@ def result_to_dict(r: PairResult, records: dict[str, VideoRecord]) -> dict:
         "coverage": round(r.coverage, 4),
         "query_duration": round(r.query_duration, 2),
         "target_duration": round(r.target_duration, 2),
+        "query_size_bytes": _size_bytes(records.get(r.query_id)),
+        "target_size_bytes": _size_bytes(records.get(r.target_id)),
         "segments": [
             {
                 "query_start": round(s.q_start, 2),
